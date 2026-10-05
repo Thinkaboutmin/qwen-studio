@@ -4,7 +4,8 @@
   "version": "2.2.3",
   "identifier": "com.qwen.studio",
   "build": {
-    "frontendDist": "./dist"
+    "frontendDist": "./dist",
+    "beforeBuildCommand": "mkdir -p dist && touch dist/.gitkeep"
   },
   "app": {
     "withGlobalTauri": true,
@@ -27,6 +28,12 @@
       "icons/icon.ico"
     ],
     "linux": {
+      "appimage": {
+        "bundleMediaFramework": true,
+        "files": {
+          "/usr/share/applications/qwen-studio.desktop": "qwen-studio.desktop"
+        }
+      },
       "deb": {
         "depends": ["webkit2gtk-4.1"],
         "desktopTemplate": "qwen-studio.desktop"

@@ -2,9 +2,10 @@
 [Desktop Entry]
 Name=Qwen Studio
 Comment=Open-source Qwen AI desktop client with MCP support
-Exec=env WEBKIT_DISABLE_COMPOSITING_MODE=1 WEBKIT_DISABLE_DMABUF_RENDERER=1 /usr/bin/qwen-studio
-Icon=qwen-studio
+Exec={{exec}}
+Icon={{icon}}
 Terminal=false
 Type=Application
 Categories=Development;Chat;Network;
 StartupWMClass=qwen-studio
+MimeType=x-scheme-handler/qwen;
