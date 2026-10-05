@@ -1,4 +1,2 @@
-node_modules/
-dist/
-target-
-src-tauri/target/
+(empty)/node_modules
+/patches
