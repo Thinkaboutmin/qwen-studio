@@ -611,7 +611,7 @@
             if (!url) return originalOpen.call(window, url, name, features);
 
             var isAuthUrl = /login|auth|oauth|callback|signin|signup/.test(url) ||
-              /accounts\.qwen\.ai|account\.qwen\.ai|passport\.alibaba\.com|login\.alibaba|signin\.alibaba|accounts\.alibaba|login\.aliyun|account\.aliyun/.test(url);
+              /accounts\.qwen\.ai|account\.qwen\.ai|chat\.qwen\.com|passport\.alibaba\.com|login\.alibaba|signin\.alibaba|accounts\.alibaba|login\.aliyun|account\.aliyun/.test(url);
 
             if (isAuthUrl) {
               console.log('[ElectronBridge] Intercepting window.open for auth URL → navigating current window');
@@ -638,7 +638,7 @@
         (function handleOAuthCallback() {
           var currentUrl = window.location.href;
           var isCallback = /callback|oauth.*callback|auth.*callback/.test(currentUrl) ||
-            (currentUrl.includes('chat.qwen.ai') && (currentUrl.includes('token=') || currentUrl.includes('code=') || currentUrl.includes('sid=') || currentUrl.includes('ticket=')));
+            ((currentUrl.includes('chat.qwen.ai') || currentUrl.includes('chat.qwen.com')) && (currentUrl.includes('token=') || currentUrl.includes('code=') || currentUrl.includes('sid=') || currentUrl.includes('ticket=')));
 
           if (!isCallback) return;
 
@@ -668,6 +668,9 @@
             document.cookie = 'token=' + token + '; domain=.qwen.ai; path=/; max-age=2592000';
             document.cookie = 'sid=' + token + '; domain=.qwen.ai; path=/; max-age=2592000';
             document.cookie = 'ticket=' + token + '; domain=.qwen.ai; path=/; max-age=2592000';
+            document.cookie = 'token=' + token + '; domain=.qwen.com; path=/; max-age=2592000';
+            document.cookie = 'sid=' + token + '; domain=.qwen.com; path=/; max-age=2592000';
+            document.cookie = 'ticket=' + token + '; domain=.qwen.com; path=/; max-age=2592000';
 
             console.log('[ElectronBridge] Token stored successfully');
 

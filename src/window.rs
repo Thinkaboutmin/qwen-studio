@@ -35,6 +35,7 @@ pub async fn create_new_window(app: tauri::AppHandle) -> Result<String, String> 
         let url_str = url.to_string();
         let auth_domains = [
             "chat.qwen.ai",
+            "chat.qwen.com",
             "accounts.qwen.ai",
             "account.qwen.ai",
             "login.qwen.ai",
@@ -58,8 +59,8 @@ pub async fn create_new_window(app: tauri::AppHandle) -> Result<String, String> 
             || url_str.contains("/signin")
             || url_str.contains("/signup");
         
-        // Allow navigation if it's auth-related or back to chat.qwen.ai
-        if is_auth_domain || is_auth_path || url_str.starts_with("https://chat.qwen.ai") {
+        // Allow navigation if it's auth-related or back to the chat app
+        if is_auth_domain || is_auth_path || url_str.starts_with("https://chat.qwen.ai") || url_str.starts_with("https://chat.qwen.com") {
             true
         } else {
             // For non-auth external URLs, they'll be handled by open_external_link
@@ -85,7 +86,7 @@ pub fn build_init_script() -> String {
             var pathname = window.location.pathname;
             var isLoginPage = pathname.includes('login') || pathname.includes('auth') || pathname.includes('callback') || pathname.includes('oauth');
             
-            if (hostname !== 'chat.qwen.ai' || isLoginPage) {
+            if ((hostname !== 'chat.qwen.ai' && hostname !== 'chat.qwen.com') || isLoginPage) {
                 return;
             }
 
@@ -589,6 +590,7 @@ pub async fn open_external_link(app: tauri::AppHandle, url: String) -> Result<bo
 
     // Auth/login URLs → navigate inside the WebView instead of opening external browser
     let auth_domains = [
+        "chat.qwen.com",
         "accounts.qwen.ai",
         "account.qwen.ai",
         "login.qwen.ai",
@@ -831,7 +833,7 @@ pub async fn handle_deep_link_url(app: &tauri::AppHandle, url: &str) {
                                 window.url().map(|u| u.to_string()).unwrap_or_default();
                             log::info!("[DeepLink] Current webview URL: {}", current_url);
 
-                            if !current_url.contains("chat.qwen.ai") {
+                            if !(current_url.contains("chat.qwen.ai") || current_url.contains("chat.qwen.com")) {
                                 log::info!("[DeepLink] Navigating to chat.qwen.ai first");
                                 let _ =
                                     window.eval("window.location.href = 'https://chat.qwen.ai';");
@@ -844,6 +846,9 @@ pub async fn handle_deep_link_url(app: &tauri::AppHandle, url: &str) {
                                         document.cookie = "token={token}; domain=.qwen.ai; path=/; max-age=2592000";
                                         document.cookie = "sid={token}; domain=.qwen.ai; path=/; max-age=2592000";
                                         document.cookie = "ticket={token}; domain=.qwen.ai; path=/; max-age=2592000";
+                                        document.cookie = "token={token}; domain=.qwen.com; path=/; max-age=2592000";
+                                        document.cookie = "sid={token}; domain=.qwen.com; path=/; max-age=2592000";
+                                        document.cookie = "ticket={token}; domain=.qwen.com; path=/; max-age=2592000";
                                         localStorage.setItem("token", "{token}");
                                         localStorage.setItem("sid", "{token}");
                                         localStorage.setItem("ticket", "{token}");

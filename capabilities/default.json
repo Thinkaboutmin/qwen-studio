@@ -4,7 +4,7 @@
   "description": "Default capabilities for Qwen Studio",
   "windows": ["main", "window-*"],
   "remote": {
-    "urls": ["https://*.qwen.ai", "https://chat.qwen.ai", "https://*.alibaba.com", "https://*.aliyun.com", "https://*.alibabacloud.com"]
+    "urls": ["https://*.qwen.ai", "https://chat.qwen.ai", "https://*.qwen.com", "https://chat.qwen.com", "https://*.alibaba.com", "https://*.aliyun.com", "https://*.alibabacloud.com"]
   },
   "permissions": [
     "core:default",

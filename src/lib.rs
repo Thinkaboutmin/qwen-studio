@@ -107,6 +107,7 @@ pub fn run() {
                 let url_str = url.to_string();
                 let auth_domains = [
                     "chat.qwen.ai",
+                    "chat.qwen.com",
                     "accounts.qwen.ai",
                     "account.qwen.ai",
                     "login.qwen.ai",
@@ -130,8 +131,8 @@ pub fn run() {
                     || url_str.contains("/signin")
                     || url_str.contains("/signup");
                 
-                // Allow navigation if it's auth-related or back to chat.qwen.ai
-                if is_auth_domain || is_auth_path || url_str.starts_with("https://chat.qwen.ai") {
+                // Allow navigation if it's auth-related or back to the chat app
+                if is_auth_domain || is_auth_path || url_str.starts_with("https://chat.qwen.ai") || url_str.starts_with("https://chat.qwen.com") {
                     true
                 } else {
                     // For non-auth external URLs, they'll be handled by open_external_link
