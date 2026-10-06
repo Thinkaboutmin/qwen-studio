@@ -13,10 +13,68 @@ fn setup_gtk_drag_drop(_app: &tauri::AppHandle) {
     log::info!("[DragDrop] Events will be forwarded via Tauri window events");
 }
 
+/// AppImage SIGSEGV fix (re-exec stage). linuxdeploy's gtk plugin does not
+/// copy libEGL.so.1 into the bundle (it only ships libwayland-egl.so.1), so
+/// inside the AppDir `ldd usr/bin/qwen-studio` reports
+/// "libEGL.so.1 => not found" and the dynamic loader kills the process with
+/// SIGSEGV *before main() runs* — meaning in-process env fixes are useless
+/// for that launch. The only reliable cure is to re-exec ourselves once with
+/// LD_PRELOAD pointing at the host's libEGL.so.1 (always present on systems
+/// that can run WebKitGTK apps). The sentinel env var prevents loops, and the
+/// whole block is a no-op when libEGL cannot be found or we are not running
+/// under an AppImage (deb/rpm keep working untouched).
+#[cfg(target_os = "linux")]
+fn relaunch_with_libegl_preloaded() {
+    const SENTINEL: &str = "QWEN_STUDIO_LIBEGL_RELAUNCHED";
+    if std::env::var(SENTINEL).is_ok() {
+        return; // already relaunched; proceed normally
+    }
+    let needs_egl = std::env::var("LD_PRELOAD")
+        .map(|v| !v.contains("libEGL"))
+        .unwrap_or(true);
+    if !needs_egl {
+        return;
+    }
+    const CANDIDATES: &[&str] = &[
+        "/usr/lib/x86_64-linux-gnu/libEGL.so.1",
+        "/usr/lib64/libEGL.so.1",
+        "/usr/lib/libEGL.so.1",
+        "/usr/lib/i386-linux-gnu/libEGL.so.1",
+    ];
+    let egl = match CANDIDATES.iter().find(|p| std::path::Path::new(p).exists()) {
+        Some(p) => (*p).to_string(),
+        None => return, // unusual system: don't touch anything
+    };
+    let mut preload = egl.clone();
+    if let Ok(prev) = std::env::var("LD_PRELOAD") {
+        if !prev.is_empty() {
+            preload = format!("{prev} {egl}");
+        }
+    }
+    let exe = match std::env::current_exe() {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    log::info!("[startup] re-exec with LD_PRELOAD={preload}");
+    let status = std::process::Command::new(exe)
+        .args(args)
+        .env("LD_PRELOAD", preload)
+        .env(SENTINEL, "1")
+        .status();
+    match status {
+        Ok(s) => std::process::exit(s.code().unwrap_or(0)),
+        // If spawning failed (read-only /proc, sandbox, etc.) fall through
+        // and continue in-process below; best-effort only.
+        Err(_) => {}
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     #[cfg(target_os = "linux")]
     {
+        relaunch_with_libegl_preloaded();
         if std::env::var("GDK_BACKEND").is_err() {
             unsafe { std::env::set_var("GDK_BACKEND", "x11") };
         }
@@ -32,36 +90,6 @@ pub fn run() {
             }
             if std::env::var("WEBKIT_DISABLE_DMABUF_RENDERER").is_err() {
                 std::env::set_var("WEBKIT_DISABLE_DMABUF_RENDERER", "1");
-            }
-        }
-
-        // AppImage SIGSEGV fix: linuxdeploy's gtk plugin does not copy
-        // libEGL.so.1 into the bundle (it only ships libwayland-egl.so.1), so
-        // `ldd usr/bin/qwen-studio` reports "libEGL.so.1 => not found" inside
-        // the AppDir and the dynamic loader kills the process with SIGSEGV
-        // before main() runs. The system library is always present on hosts
-        // that can run WebKitGTK apps, but AppRun prepends $APPDIR/usr/lib to
-        // LD_LIBRARY_PATH and some distros/paths still miss the default
-        // lookup. Preload it explicitly via LD_PRELOAD so the loader binds it
-        // regardless of search-path ordering; silently no-op when unavailable
-        // (deb/rpm or unusual systems) to avoid breaking startup there.
-        {
-            const CANDIDATES: &[&str] = &[
-                "/usr/lib/x86_64-linux-gnu/libEGL.so.1",
-                "/usr/lib64/libEGL.so.1",
-                "/usr/lib/libEGL.so.1",
-            ];
-            let already = std::env::var("LD_PRELOAD")
-                .map(|v| v.contains("libEGL"))
-                .unwrap_or(false);
-            if !already {
-                if let Some(path) = CANDIDATES.iter().find(|p| std::path::Path::new(p).exists()) {
-                    let value = match std::env::var("LD_PRELOAD") {
-                        Ok(prev) if !prev.is_empty() => format!("{prev} {path}"),
-                        _ => (*path).to_string(),
-                    };
-                    unsafe { std::env::set_var("LD_PRELOAD", value) };
-                }
             }
         }
     }
