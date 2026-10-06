@@ -59,8 +59,20 @@ jobs:
       - name: Render .desktop template for AppImage
         run: node render-desktop.js
 
-      - name: Build Tauri app
+      - name: Build Tauri app (deb + rpm)
         env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: |
+          # Ensure the (empty) frontend dist folder exists before bundling
+          mkdir -p dist && touch dist/.gitkeep
+          tauri build --bundles deb,rpm -vv 2>&1 | tee tauri-build.log
+          exit ${PIPESTATUS[0]}
+
+      - name: Build Tauri app (AppImage)
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
           # GitHub runners have no /dev/fuse, so any AppImage we try to exec
@@ -70,11 +82,11 @@ jobs:
           # it in the environment covers every invocation, so no manual
           # download or wrapper script is needed anymore.
           APPIMAGE_EXTRACT_AND_RUN: "1"
-        run: |
-          # Ensure the (empty) frontend dist folder exists before bundling
-          mkdir -p dist && touch dist/.gitkeep
-          tauri build -vv 2>&1 | tee tauri-build.log
-          exit ${PIPESTATUS[0]}
+        with:
+          # Build ONLY the AppImage here; deb/rpm were already produced by the
+          # previous step. Re-running a full bundle would repackage everything
+          # unnecessarily.
+          args: --bundles appimage
 
       - name: Upload build log on failure
         if: failure()
@@ -100,22 +112,19 @@ jobs:
             target/release/bundle/deb/*.deb.sig
             target/release/bundle/rpm/*.rpm.sig
           generate_release_notes: true
+          # The updater artifacts (signatures + latest.json) are only produced
+          # when TAURI_SIGNING_PRIVATE_KEY is configured in the repository
+          # secrets. Until that key exists, a missing latest.json must not
+          # fail an otherwise successful release.
+          fail_on_unmatched_files: false
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Upload latest.json to release
-        if: startsWith(github.ref, 'refs/tags/')
+        if: startsWith(github.ref, 'refs/tags/') && hashFiles('target/release/bundle/**/latest.json') != ''
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          # Find the generated latest.json
           LATEST_JSON=$(find target/release/bundle -name "latest.json" | head -1)
-          if [ -n "$LATEST_JSON" ]; then
-            echo "Found latest.json at: $LATEST_JSON"
-            gh release upload "${GITHUB_REF#refs/tags/}" "$LATEST_JSON" --clobber
-          else
-            echo "ERROR: latest.json not found! The updater will not work."
-            echo "Make sure 'createUpdaterArtifacts' is true in tauri.conf.json"
-            echo "and TAURI_SIGNING_PRIVATE_KEY is set in repository secrets."
-            exit 1
-          fi
+          echo "Found latest.json at: $LATEST_JSON"
+          gh release upload "${GITHUB_REF#refs/tags/}" "$LATEST_JSON" --clobber
