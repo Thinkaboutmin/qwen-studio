@@ -63,26 +63,16 @@ jobs:
         env:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          # GitHub runners have no /dev/fuse, so any AppImage we try to exec
+          # (linuxdeploy, appimagetool) must self-extract instead of mounting.
+          # The bundler runs both tools as `AppImage <args>`, which fails with
+          # ENOENT/"failed to run linuxdeploy" without this variable. Setting
+          # it in the environment covers every invocation, so no manual
+          # download or wrapper script is needed anymore.
+          APPIMAGE_EXTRACT_AND_RUN: "1"
         run: |
           # Ensure the (empty) frontend dist folder exists before bundling
           mkdir -p dist && touch dist/.gitkeep
-          # The bundler downloads linuxdeploy into ~/.cache/tauri only right
-          # before running it, so pre-download the same artifact here and wrap
-          # it with a script that always passes --appimage-extract-and-run.
-          # GitHub runners have no /dev/fuse, which makes the raw AppImage fail
-          # with "failed to run linuxdeploy".
-          LD_CACHE="$HOME/.cache/tauri"
-          mkdir -p "$LD_CACHE"
-          LD_BIN="$LD_CACHE/linuxdeploy-07333c6-x86_64.AppImage"
-          if [ ! -f "$LD_BIN" ]; then
-            curl -fsSL -o "$LD_BIN" https://github.com/tauri-apps/binary-releases/releases/download/linuxdeploy-07333c6/linuxdeploy-x86_64.AppImage
-          fi
-          chmod +x "$LD_BIN"
-          rm -rf /tmp/linuxdeploy-root
-          "$LD_BIN" --appimage-extract >/dev/null
-          mv "$LD_BIN" "$LD_BIN.real"
-          printf '#!/bin/sh\nexec /tmp/linuxdeploy-root/AppRun --appimage-extract-and-run "$@"\n' > "$LD_BIN"
-          chmod +x "$LD_BIN"
           tauri build -vv 2>&1 | tee tauri-build.log
           exit ${PIPESTATUS[0]}
 
