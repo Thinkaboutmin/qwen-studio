@@ -1,7 +1,7 @@
 {
   "$schema": "./node_modules/@tauri-apps/cli/config.schema.json",
   "productName": "Qwen Studio",
-  "version": "2.2.3",
+  "version": "2.2.4",
   "identifier": "com.qwen.studio",
   "build": {
     "frontendDist": "./dist",
@@ -29,17 +29,18 @@
     ],
     "linux": {
       "appimage": {
-        "bundleMediaFramework": true,
-        "files": {
-          "/usr/share/applications/qwen-studio.desktop": "qwen-studio.desktop"
-        }
+        "bundleMediaFramework": true
       },
       "deb": {
-        "depends": ["webkit2gtk-4.1"],
+        "depends": [
+          "webkit2gtk-4.1"
+        ],
         "desktopTemplate": "qwen-studio.desktop"
       },
       "rpm": {
-        "depends": ["webkit2gtk4.1"],
+        "depends": [
+          "webkit2gtk4.1"
+        ],
         "desktopTemplate": "qwen-studio.desktop",
         "compression": {
           "type": "none"
@@ -51,7 +52,9 @@
     "deep-link": {
       "mobile": [],
       "desktop": {
-        "schemes": ["qwen"]
+        "schemes": [
+          "qwen"
+        ]
       }
     },
     "updater": {

@@ -88,6 +88,29 @@ jobs:
           # unnecessarily.
           args: --bundles appimage
 
+      - name: Verify AppImage bundle integrity
+        # Guards against shipping broken AppImages again (v2.2.3 SIGSEGV'd at
+        # startup because the injected .desktop had a quoted Exec and the
+        # bundle was missing libEGL.so.1). Fails the release early if either
+        # regression reappears.
+        run: |
+          set -euo pipefail
+          APPIMAGE=$(find target/release/bundle/appimage -name '*.AppImage' | head -1)
+          test -n "$APPIMAGE" || { echo "No AppImage produced"; exit 1; }
+          rm -rf /tmp/verify-appdir
+          APPIMAGE_EXTRACT_AND_RUN=1 "$APPIMAGE" --appimage-extract >/dev/null
+          cd squashfs-root && mv "$(pwd)" /tmp/verify-appdir && cd /
+          ROOT=/tmp/verify-appdir
+          DESKTOP_COUNT=$(find "$ROOT" -maxdepth 1 -name '*.desktop' | wc -l)
+          echo "Desktop files in AppDir root: $DESKTOP_COUNT"
+          [ "$DESKTOP_COUNT" -eq 1 ] || { echo "ERROR: expected exactly 1 .desktop file"; exit 1; }
+          EXEC_LINE=$(grep '^Exec=' "$ROOT"/*.desktop)
+          echo "Exec line: $EXEC_LINE"
+          case "$EXEC_LINE" in *'"'*) echo "ERROR: Exec contains literal quotes"; exit 1;; esac
+          BIN=$(find "$ROOT/usr/bin" -type f | head -1)
+          ldd "$BIN" 2>/dev/null | grep 'not found' && { echo "ERROR: unresolved libs in bundle"; exit 1; } || true
+          echo "AppImage verification passed."
+
       - name: Upload build log on failure
         if: failure()
         uses: actions/upload-artifact@v4

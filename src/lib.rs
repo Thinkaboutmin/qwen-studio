@@ -34,6 +34,36 @@ pub fn run() {
                 std::env::set_var("WEBKIT_DISABLE_DMABUF_RENDERER", "1");
             }
         }
+
+        // AppImage SIGSEGV fix: linuxdeploy's gtk plugin does not copy
+        // libEGL.so.1 into the bundle (it only ships libwayland-egl.so.1), so
+        // `ldd usr/bin/qwen-studio` reports "libEGL.so.1 => not found" inside
+        // the AppDir and the dynamic loader kills the process with SIGSEGV
+        // before main() runs. The system library is always present on hosts
+        // that can run WebKitGTK apps, but AppRun prepends $APPDIR/usr/lib to
+        // LD_LIBRARY_PATH and some distros/paths still miss the default
+        // lookup. Preload it explicitly via LD_PRELOAD so the loader binds it
+        // regardless of search-path ordering; silently no-op when unavailable
+        // (deb/rpm or unusual systems) to avoid breaking startup there.
+        {
+            const CANDIDATES: &[&str] = &[
+                "/usr/lib/x86_64-linux-gnu/libEGL.so.1",
+                "/usr/lib64/libEGL.so.1",
+                "/usr/lib/libEGL.so.1",
+            ];
+            let already = std::env::var("LD_PRELOAD")
+                .map(|v| v.contains("libEGL"))
+                .unwrap_or(false);
+            if !already {
+                if let Some(path) = CANDIDATES.iter().find(|p| std::path::Path::new(p).exists()) {
+                    let value = match std::env::var("LD_PRELOAD") {
+                        Ok(prev) if !prev.is_empty() => format!("{prev} {path}"),
+                        _ => (*path).to_string(),
+                    };
+                    unsafe { std::env::set_var("LD_PRELOAD", value) };
+                }
+            }
+        }
     }
 
     // Init script is now built by window::build_init_script() for consistency
