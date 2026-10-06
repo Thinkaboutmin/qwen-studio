@@ -63,7 +63,23 @@ jobs:
         run: |
           # Ensure the (empty) frontend dist folder exists before bundling
           mkdir -p dist && touch dist/.gitkeep
-          tauri build
+          # linuxdeploy is distributed as an AppImage and needs FUSE. On GitHub
+          # runners /dev/fuse does not exist, so make the bundler use its
+          # --appdir fallback instead of trying to mount the AppImage.
+          if [ ! -e /dev/fuse ]; then
+            export LINUXDEPLOY_OUTPUT_VERSION="${GITHUB_REF_NAME#v}"
+            export LD_APPDIR="/tmp/$(echo 'Qwen Studio' | tr '[:upper:]' '[:lower:]')_AppDir"
+          fi
+          tauri build -vv 2>&1 | tee tauri-build.log
+          exit ${PIPESTATUS[0]}
+
+      - name: Upload build log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tauri-build-log
+          path: tauri-build.log
+          retention-days: 7
 
       - name: List bundle artifacts
         if: always()
