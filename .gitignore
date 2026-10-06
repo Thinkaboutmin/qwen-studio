@@ -1,2 +1,4 @@
-(empty)/node_modules
-/patches
+node_modules/
+dist/
+target/
+*.log
