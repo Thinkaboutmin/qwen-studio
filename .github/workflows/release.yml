@@ -33,8 +33,16 @@ jobs:
       - name: Install system dependencies
         run: |
           sudo apt-get update
+          # The app links gtk 0.18 directly (Cargo.toml linux target deps) for the custom
+          # header-bar menu and clipboard, so the full GTK3 dev stack must be installed
+          # explicitly. Previously only webkit2gtk was installed and cargo failed at
+          # gdk-sys: "Package gdk-3.0 was not found in the pkg-config search path".
           sudo apt-get install -y \
+            libgtk-3-dev \
+            libgdk-pixbuf-2.0-dev \
             libwebkit2gtk-4.1-dev \
+            javascriptcoregtk-4.1 \
+            libsoup-3.0-dev \
             libayatana-appindicator3-dev \
             librsvg2-dev \
             patchelf \
