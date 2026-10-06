@@ -1,7 +1,7 @@
 #!/usr/bin/env xdg-open
 [Desktop Entry]
-Name=Qwen Studio
-Comment=Open-source Qwen AI desktop client with MCP support
+Name={{product_name}}
+Comment={{comment}}
 Exec={{exec}}
 Icon={{icon}}
 Terminal=false
