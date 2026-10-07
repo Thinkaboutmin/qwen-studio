@@ -87,6 +87,40 @@ jobs:
           tauri build --bundles deb,rpm -vv 2>&1 | tee tauri-build.log
           exit ${PIPESTATUS[0]}
 
+      - name: Patch linuxdeploy-plugin-gtk.sh to copy Mesa EGL/GL into the bundle
+        # Root cause of the grey screen (EGL_BAD_PARAMETER) and SIGSEGV in
+        # v2.2.3..v2.2.5: the gtk plugin copies GTK/pixbuf libs but NEVER
+        # libEGL.so.1/libGL.so.1, and bundleMediaFramework drags gstreamer
+        # libs whose rpath resolves an old CUDA/NVIDIA stub on real hosts.
+        # We append a block to the plugin script that linuxdeploy downloads
+        # at build time (cached under ~/.cache/linuxdeploy): if the AppDir
+        # ends up without libEGL.so.1, copy the system Mesa providers into
+        # usr/lib. AppRun's LD_LIBRARY_PATH=$APPDIR/usr/lib then resolves
+        # them for the main process AND all WebKitGTK GPU child processes.
+        run: |
+          set -euo pipefail
+          PLUGIN=$(find "$HOME/.cache/linuxdeploy" -name 'linuxdeploy-plugin-gtk.sh' 2>/dev/null | head -1 || true)
+          if [ -z "$PLUGIN" ]; then
+            mkdir -p "$HOME/.cache/linuxdeploy"
+            PLUGIN="$HOME/.cache/linuxdeploy/linuxdeploy-plugin-gtk.sh"
+            curl -sSL -o "$PLUGIN" https://raw.githubusercontent.com/tauri-apps/linuxdeploy-plugin-gtk/master/linuxdeploy-plugin-gtk.sh
+            chmod +x "$PLUGIN"
+          fi
+          cat >> "$PLUGIN" <<'EOF'
+
+          # --- qwen-studio CI patch: stage Mesa EGL/GL into the bundle ---
+          if ! find "$APPDIR/usr" -name 'libEGL.so.1' 2>/dev/null | grep -q .; then
+            echo "[gtk-plugin/qwen] staging system Mesa EGL/GL into $APPDIR/usr/lib"
+            mkdir -p "$APPDIR/usr/lib"
+            for n in libEGL.so.1 libGL.so.1; do
+              for d in /usr/lib/x86_64-linux-gnu /usr/lib64 /usr/lib /usr/lib/mesa /usr/lib/mesa-libgl; do
+                if [ -e "$d/$n" ]; then cp -L "$d/$n" "$APPDIR/usr/lib/" && break; fi
+              done
+            done
+          fi
+          EOF
+          echo "Patched $PLUGIN:"; tail -15 "$PLUGIN"
+
       - name: Build Tauri app (AppImage)
         uses: tauri-apps/tauri-action@v0
         env:
@@ -135,6 +169,14 @@ jobs:
           if ldd "$BIN" 2>/dev/null | grep 'not found'; then
             echo "NOTE: unresolved libs above are expected for libEGL/libGL — src/lib.rs preloads the host Mesa copies at startup inside AppImages."
           fi
+          # Hard gate: the gtk-plugin CI patch (and/or the staging hook in
+          # src/lib.rs) must have bundled the Mesa EGL/GL providers. Without
+          # them every non-Ubuntu host shows a grey screen (EGL_BAD_PARAMETER).
+          find "$ROOT/usr/lib" -name 'libEGL.so.1' | grep -q . \
+            || { echo "ERROR: libEGL.so.1 not staged into bundle"; exit 1; }
+          find "$ROOT/usr/lib" -name 'libGL.so.1' | grep -q . \
+            || { echo "ERROR: libGL.so.1 not staged into bundle"; exit 1; }
+          echo "Mesa EGL/GL staged OK."
           echo "AppImage verification passed."
 
       - name: Upload build log on failure
@@ -191,11 +233,16 @@ jobs:
       image: archlinux/archlinux:latest
     steps:
       - name: Install build dependencies
+        # NOTE: Arch has no `libxdo` package — the XDO library ships inside
+        # `xdotool` (provides libxdo.so). v2.2.6 failed here with
+        # "error: target not found: libxdo". `desktop-file-utils` is needed
+        # because tauri-bundler runs update-desktop-database when bundling the
+        # deb payload we reuse as the Arch rootfs.
         run: |
           pacman -Syu --noconfirm --needed \
             base-devel git nodejs npm rust pkgconf curl \
             webkit2gtk-4.1 gtk3 librsvg libayatana-appindicator \
-            openssl libxdo patchelf zstd
+            openssl xdotool patchelf zstd desktop-file-utils
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0

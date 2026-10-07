@@ -38,6 +38,58 @@ fn find_system_mesa_lib(name: &str) -> Option<String> {
         .find(|p| std::path::Path::new(p).exists())
 }
 
+/// Bundle-time helper: copy the system Mesa EGL/GL providers into the AppDir.
+///
+/// When Tauri's AppImage bundler invokes linuxdeploy it sets APPDIR to the
+/// staging directory (target/release/bundle/appimage/<name>.AppDir) and runs
+/// beforeBundleCommand from inside that folder (current_dir = appdir), so we
+/// can detect the bundling phase here instead of shipping a patched
+/// linuxdeploy-plugin-gtk.sh in CI.
+///
+/// Why this is needed: linuxdeploy's gtk plugin copies GTK/pixbuf libs but
+/// never libEGL.so.1/libGL.so.1, and bundleMediaFramework drags in gstreamer
+/// libs whose rpath points at an old CUDA/NVIDIA stub. The result on real
+/// hosts was "Could not create default EGL display: EGL_BAD_PARAMETER" ->
+/// grey window (v2.2.5) or SIGSEGV (v2.2.3/2.2.4). With the *Mesa* copies
+/// present under <AppDir>/usr/lib, the bundled AppRun's own LD_LIBRARY_PATH
+/// export makes the loader resolve them for the main process AND for every
+/// WebKitGTK GPU child process — no LD_PRELOAD relaunch games required.
+///
+/// No-op unless APPDIR is set and currently contains usr/bin (i.e. we are
+/// really inside the AppImage bundling step; deb/rpm builds and normal app
+/// runs never satisfy both conditions).
+#[cfg(target_os = "linux")]
+fn stage_mesa_libs_into_appdir() {
+    let Some(appdir) = std::env::var_os("APPDIR") else {
+        return;
+    };
+    let appdir = std::path::PathBuf::from(appdir);
+    // Only act during AppImage bundling: the AppDir always has usr/bin by the
+    // time beforeBundleCommand runs.
+    if !appdir.join("usr/bin").is_dir() {
+        return;
+    }
+    let dest = appdir.join("usr/lib");
+    std::fs::create_dir_all(&dest).ok();
+    let mut staged = 0usize;
+    for name in ["libEGL.so.1", "libGL.so.1"] {
+        let Some(src) = find_system_mesa_lib(name) else {
+            log::warn!("[bundle] system {name} not found; skipping (runtime preload fallback still applies)");
+            continue;
+        };
+        let target = dest.join(name);
+        // cp -L: dereference symlinks so the file survives AppImage squashfs.
+        match std::fs::copy(&src, &target) {
+            Ok(_) => {
+                staged += 1;
+                log::info!("[bundle] staged {src} -> {}", target.display());
+            }
+            Err(e) => log::error!("[bundle] failed to stage {src}: {e}"),
+        }
+    }
+    log::info!("[bundle] Mesa staging complete ({staged}/2 libs in {})", dest.display());
+}
+
 /// AppImage GL/EGL startup fix (single re-exec).
 ///
 /// Two problems are solved at once, both requiring action *before* any GL
@@ -128,6 +180,12 @@ fn relaunch_for_mesa_egl() {
 pub fn run() {
     #[cfg(target_os = "linux")]
     {
+        // AppImage *bundling* phase: linuxdeploy runs this same binary with
+        // APPDIR set before it invokes itself; stage Mesa EGL/GL into the
+        // AppDir so the shipped bundle resolves them natively (fixes the
+        // grey-screen EGL_BAD_PARAMETER root cause at build time). This call
+        // is a no-op during normal app execution.
+        stage_mesa_libs_into_appdir();
         relaunch_for_mesa_egl();
         if std::env::var("GDK_BACKEND").is_err() {
             unsafe { std::env::set_var("GDK_BACKEND", "x11") };
