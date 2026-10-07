@@ -1,7 +1,7 @@
 {
   "$schema": "./node_modules/@tauri-apps/cli/config.schema.json",
   "productName": "Qwen Studio",
-  "version": "2.2.11",
+  "version": "2.2.12",
   "identifier": "com.qwen.studio",
   "build": {
     "frontendDist": "./dist",

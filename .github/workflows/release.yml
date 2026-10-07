@@ -289,10 +289,15 @@ jobs:
           # as pacman's libalpm does (.PKGINFO at tar root). If this ever fails
           # the release must NOT receive the artifact.
           zstd -qt "$PKG"
-          tar --zstd -tf "$PKG" | grep -qx './.PKGINFO' || { echo "ERROR: .PKGINFO not at tar root"; tar --zstd -tf "$PKG" | head; exit 1; }
-          tar --zstd -tf "$PKG" | grep -q './usr/bin/qwen-studio'
-          tar --zstd -tf "$PKG" | grep -q '.desktop'
-          tar --zstd -tf "$PKG" | grep 'icons/hicolor' | head -3
+          # Materialize the listing once — piping `tar -tf` straight into
+          # `grep -q` makes tar die with SIGPIPE (exit 141) when grep quits
+          # early, which under `sh -e` aborts the whole step even though the
+          # package is perfectly valid.
+          LISTING="$(tar --zstd -tf "$PKG")"
+          printf '%s\n' "$LISTING" | grep -qx './.PKGINFO' || { echo "ERROR: .PKGINFO not at tar root"; printf '%s\n' "$LISTING" | head; exit 1; }
+          printf '%s\n' "$LISTING" | grep -q './usr/bin/qwen-studio' || { echo "ERROR: binary missing from package"; exit 1; }
+          printf '%s\n' "$LISTING" | grep -q '.desktop' || { echo "ERROR: no .desktop in package"; exit 1; }
+          printf '%s\n' "$LISTING" | grep 'icons/hicolor' | head -3
           ls -la "$PKG"
           echo "Arch package ready and verified."
       - name: Upload Arch package to release
