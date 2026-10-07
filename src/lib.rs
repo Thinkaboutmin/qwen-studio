@@ -72,6 +72,19 @@ fn find_system_mesa_lib(name: &str) -> Option<String> {
 ///    workarounds — all propagated to WebNetworkProcess/WebKitGPUProcess.
 /// A sentinel env var guarantees at most one re-exec; if spawning fails we
 /// continue best-effort in-process.
+/// True when running from inside a mounted AppImage (AppRun exports APPDIR to
+/// the squashfs mount point). The v2.2.12 SIGSEGV on openSUSE-style hosts came
+/// from re-execing `current_exe()` — which for an AppImage is the *runtime*
+/// FUSE mount path (`/tmp/.mount_XXXX/usr/bin/qwen-studio`). When that process
+/// then calls `current_exe()` again during GTK/GDK init (portal lookup), the
+/// FUSE daemon servicing the mount is busy waiting in `cmd.status()` and
+/// cannot answer reads on its own filesystem -> deadlock/SIGSEGV. Relaunches
+/// must therefore always target `$APPDIR/AppRun`, never the runtime mount.
+#[cfg(target_os = "linux")]
+fn appdir_root() -> Option<std::path::PathBuf> {
+    std::env::var("APPDIR").ok().map(std::path::PathBuf::from)
+}
+
 #[cfg(target_os = "linux")]
 fn relaunch_for_gl_fix() {
     const SENTINEL: &str = "QWEN_STUDIO_MESA_RELAUNCHED";
@@ -88,15 +101,41 @@ fn relaunch_for_gl_fix() {
         .map(|v| v.contains("libEGL"))
         .unwrap_or(false);
 
+    // AppImage: NEVER re-exec current_exe() — inside a mounted AppImage it is
+    // the runtime FUSE path (/tmp/.mount_XXXX/usr/bin/qwen-studio) and
+    // spawning/waiting on it from the same process deadlocks/SIGSEGVs (the
+    // v2.2.5..v2.2.12 crash). Re-exec the extracted $APPDIR/AppRun instead,
+    // forwarding argv[1..] (AppRun execs usr/bin/<binary> with the right
+    // LD_LIBRARY_PATH). If no AppRun is found we skip the re-exec entirely
+    // and rely on the in-process env fallback below rather than risk the
+    // mount-path spawn. deb/rpm never reach this code (no APPDIR).
+    let relaunch_target: Option<std::path::PathBuf> = match appdir_root() {
+        Some(dir) => {
+            let apprun = dir.join("AppRun");
+            if apprun.exists() { Some(apprun) } else { None }
+        }
+        None => None,
+    };
+
     let mut preload_parts: Vec<String> = Vec::new();
     if let Ok(prev) = std::env::var("LD_PRELOAD") {
         if !prev.is_empty() {
             preload_parts.push(prev);
         }
     }
-    preload_parts.push(egl.clone());
-    if let Some(gl) = find_system_mesa_lib("libGL.so.1") {
-        preload_parts.push(gl);
+    // Preload ONLY inside an AppImage. On deb/rpm installs the system EGL/GL
+    // stack is already correct; forcing Mesa via LD_PRELOAD there can break
+    // native NVIDIA/AMD driver setups (and is unnecessary — the grey-screen
+    // bug was bundle-specific). The AppDir's staged Mesa copies in
+    // usr/lib (stage-mesa-libs.sh) are preferred by AppRun's
+    // LD_LIBRARY_PATH anyway; the explicit preload wins over any stale
+    // CUDA/NVIDIA stub the media framework drags along.
+    let in_appimage = appdir_root().is_some();
+    if in_appimage {
+        preload_parts.push(egl.clone());
+        if let Some(gl) = find_system_mesa_lib("libGL.so.1") {
+            preload_parts.push(gl);
+        }
     }
     let preload = preload_parts.join(" ");
 
@@ -109,30 +148,28 @@ fn relaunch_for_gl_fix() {
     .find(|p| std::path::Path::new(p).exists())
     .map(|p| p.to_string());
 
-    if !already_preloaded {
-        let exe = match std::env::current_exe() {
-            Ok(e) => e,
-            Err(_) => return,
-        };
-        let args: Vec<String> = std::env::args().skip(1).collect();
-        log::info!("[startup] Linux: re-exec with LD_PRELOAD={preload}");
-        let mut cmd = std::process::Command::new(&exe);
-        cmd.args(args)
-            .env("LD_PRELOAD", &preload)
-            .env("LIBGL_ALWAYS_SOFTWARE", "1")
-            .env("__GLX_VENDOR_LIBRARY_NAME", "mesa")
-            .env("GDK_BACKEND", "x11")
-            .env("WEBKIT_DISABLE_COMPOSITING_MODE", "1")
-            .env("WEBKIT_DISABLE_DMABUF_RENDERER", "1")
-            .env(SENTINEL, "1");
-        if let Some(json) = &egl_vendor_json {
-            cmd.env("__EGL_VENDOR_LIBRARY_FILENAMES", json);
-        }
-        match cmd.status() {
-            Ok(s) => std::process::exit(s.code().unwrap_or(0)),
-            // If spawning failed (read-only /proc, sandbox, etc.) fall through
-            // and continue in-process below; best-effort only.
-            Err(_) => {}
+    if !already_preloaded && in_appimage {
+        if let Some(exe) = relaunch_target {
+            let args: Vec<String> = std::env::args().skip(1).collect();
+            log::info!("[startup] AppImage: re-exec {} with LD_PRELOAD={}", exe.display(), preload);
+            let mut cmd = std::process::Command::new(&exe);
+            cmd.args(args)
+                .env("LD_PRELOAD", &preload)
+                .env("LIBGL_ALWAYS_SOFTWARE", "1")
+                .env("__GLX_VENDOR_LIBRARY_NAME", "mesa")
+                .env("GDK_BACKEND", "x11")
+                .env("WEBKIT_DISABLE_COMPOSITING_MODE", "1")
+                .env("WEBKIT_DISABLE_DMABUF_RENDERER", "1")
+                .env(SENTINEL, "1");
+            if let Some(json) = &egl_vendor_json {
+                cmd.env("__EGL_VENDOR_LIBRARY_FILENAMES", json);
+            }
+            match cmd.status() {
+                Ok(s) => std::process::exit(s.code().unwrap_or(0)),
+                // If spawning failed (read-only /proc, sandbox, etc.) fall
+                // through and continue in-process below; best-effort only.
+                Err(_) => {}
+            }
         }
     }
 
