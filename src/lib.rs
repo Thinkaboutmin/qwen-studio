@@ -15,6 +15,15 @@ fn setup_gtk_drag_drop(_app: &tauri::AppHandle) {
 
 /// Locate the system Mesa OpenGL/EGL provider libraries.
 ///
+/// Search order matters (v2.2.9 regression on Arch/openSUSE-style hosts):
+///  * `/usr/lib/mesa` FIRST — on Arch, /usr/lib/libEGL.so.1 is a *symlink*
+///    managed by `mesa-vdpau`/libglvnd alternatives that may point at another
+///    vendor; the real Mesa objects live under /usr/lib/mesa (and
+///    /usr/lib32/mesa). Copying/preloading those directly guarantees Mesa.
+///  * multiarch dirs next (Debian/Ubuntu layout).
+///  * plain /usr/lib(64) last, so we never accidentally pick a non-Mesa
+///    symlink when a dedicated Mesa dir exists.
+///
 /// Background: linuxdeploy's gtk plugin does not copy libEGL.so.1/libGL.so.1
 /// into the AppImage bundle, and the bundled gstreamer/media libs drag in an
 /// old host `libcuda.so.1` stub. When WebKitGTK's GPU process then calls
@@ -26,70 +35,59 @@ fn setup_gtk_drag_drop(_app: &tauri::AppHandle) {
 #[cfg(target_os = "linux")]
 fn find_system_mesa_lib(name: &str) -> Option<String> {
     const DIRS: &[&str] = &[
+        "/usr/lib/mesa",
+        "/usr/lib32/mesa",
+        "/usr/lib/mesa-libgl",
         "/usr/lib/x86_64-linux-gnu",
         "/usr/lib64",
         "/usr/lib",
-        "/usr/lib/mesa",
-        "/usr/lib/mesa-libgl",
-        "/usr/lib32",
     ];
     DIRS.iter()
         .map(|d| format!("{d}/{name}"))
         .find(|p| std::path::Path::new(p).exists())
 }
 
-/// AppImage GL/EGL startup fix (single re-exec).
+
+/// GL/EGL startup fix for *every* Linux bundle format (v2.2.9 regression).
 ///
-/// Two problems are solved at once, both requiring action *before* any GL
-/// context is created (hence the re-exec; in-process env changes would come
-/// too late for the dynamic loader and for WebKit's GPU process):
+/// v2.2.9 gated the Mesa re-exec behind `APPDIR` (AppImage-only) and a check
+/// that `ldd` reports libEGL.so.1 as "not found". On real hosts neither holds:
+///  * deb/rpm/AppImage all ship an ELF interpreter, so `ldd` resolves libEGL
+///    against the *host* system — it never prints "not found" — yet the host
+///    driver path (NVIDIA/CUDA EGL vendor, e.g. /usr/lib64/opengl/nvidia on
+///    openSUSE Tumbleweed) still answers eglGetDisplay with EGL_BAD_PARAMETER
+///    ("Could not create default EGL display: EGL_BAD_PARAMETER. Aborting..."
+///    -> grey screen / SIGSEGV);
+///  * the bundled media framework drags the same broken vendor into the
+///    AppImage GPU child processes via LD_LIBRARY_PATH.
 ///
-///  1. The bundle lacks libEGL.so.1 entirely. We LD_PRELOAD the host's Mesa
-///     libEGL.so.1 + libGL.so.1 so resolution succeeds and, crucially, so the
-///     *Mesa* implementations win symbol lookup over the stale CUDA/NVIDIA
-///     libs pulled in by the bundled media framework (which caused
-///     EGL_BAD_PARAMETER aborts and the grey screen in v2.2.5).
-///  2. WebKitGTK spawns its Network/Web/GPU processes via execvp *inheriting
-///     our environment*. LD_PRELOAD propagates to those children automatically,
-///     which is why preloading beats setting LIBGL_* env vars alone.
-///
-/// Safety: the function is a complete no-op unless ALL of these hold —
-/// we are inside an AppImage (APPDIR set), the binary actually has an
-/// unresolved libEGL.so.1 dependency, and a system Mesa libEGL exists.
-/// deb/rpm packages (where the system linker resolves libEGL normally) are
-/// never relaunched. A sentinel env var guarantees at most one re-exec.
+/// The fix must happen before ANY GL context exists (the dynamic loader and
+/// WebKit's GPU children inherit our environment), so we re-exec exactly once
+/// with:
+///  * LD_PRELOAD of the host Mesa providers (libEGL + libGL win symbol lookup
+///    over the stale CUDA/NVIDIA implementations);
+///  * __EGL_VENDOR_LIBRARY_FILENAMES pointing at the Mesa glvnd JSON, forcing
+///    EGL dispatch to Mesa even where libglvnd would otherwise pick nvidia;
+///  * LIBGL_ALWAYS_SOFTWARE=1 + GDK_BACKEND=x11 + the two WebKitGTK compositing
+///    workarounds — all propagated to WebNetworkProcess/WebKitGPUProcess.
+/// A sentinel env var guarantees at most one re-exec; if spawning fails we
+/// continue best-effort in-process.
 #[cfg(target_os = "linux")]
-fn relaunch_for_mesa_egl() {
+fn relaunch_for_gl_fix() {
     const SENTINEL: &str = "QWEN_STUDIO_MESA_RELAUNCHED";
-    // Only act inside an AppImage mount (deb/rpm never set APPDIR).
-    if std::env::var("APPDIR").is_err() || std::env::var(SENTINEL).is_ok() {
-        return;
-    }
-    // Already preloading some libEGL? Leave the user's setup alone.
-    if std::env::var("LD_PRELOAD")
-        .map(|v| v.contains("libEGL"))
-        .unwrap_or(false)
-    {
-        return;
-    }
-    // Verify the bundle genuinely fails to resolve libEGL (mirrors the
-    // missing-library condition that produced the v2.2.3/v2.2.5 crashes).
-    let ldd_ok = std::process::Command::new("ldd")
-        .arg(std::env::current_exe().unwrap_or_default())
-        .output()
-        .map(|o| {
-            String::from_utf8_lossy(&o.stdout)
-                .lines()
-                .any(|l| l.contains("libEGL.so.1") && l.contains("not found"))
-        })
-        .unwrap_or(false);
-    if !ldd_ok {
+    if std::env::var(SENTINEL).is_ok() {
         return;
     }
     let egl = match find_system_mesa_lib("libEGL.so.1") {
         Some(p) => p,
         None => return, // no Mesa available: don't touch anything
     };
+    // Already preloading some libEGL? Respect the user's setup but still fall
+    // through to set the env vars below (no re-exec needed for that).
+    let already_preloaded = std::env::var("LD_PRELOAD")
+        .map(|v| v.contains("libEGL"))
+        .unwrap_or(false);
+
     let mut preload_parts: Vec<String> = Vec::new();
     if let Ok(prev) = std::env::var("LD_PRELOAD") {
         if !prev.is_empty() {
@@ -101,26 +99,56 @@ fn relaunch_for_mesa_egl() {
         preload_parts.push(gl);
     }
     let preload = preload_parts.join(" ");
-    let exe = match std::env::current_exe() {
-        Ok(e) => e,
-        Err(_) => return,
-    };
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    log::info!("[startup] AppImage: re-exec with LD_PRELOAD={preload}");
-    let status = std::process::Command::new(exe)
-        .args(args)
-        .env("LD_PRELOAD", &preload)
-        // Belt-and-braces: force Mesa/GLVND dispatch and software fallback for
-        // the GPU process even if a vendor driver still interferes.
-        .env("LIBGL_ALWAYS_SOFTWARE", "1")
-        .env("__GLX_VENDOR_LIBRARY_NAME", "mesa")
-        .env(SENTINEL, "1")
-        .status();
-    match status {
-        Ok(s) => std::process::exit(s.code().unwrap_or(0)),
-        // If spawning failed (read-only /proc, sandbox, etc.) fall through
-        // and continue in-process below; best-effort only.
-        Err(_) => {}
+
+    // glvnd vendor override: prefer the Mesa JSON config when present.
+    let egl_vendor_json = [
+        "/usr/share/glvnd/egl_vendor.d/50_mesa.json",
+        "/usr/lib64/mesa/share/glvnd/egl_vendor.d/50_mesa.json",
+    ]
+    .into_iter()
+    .find(|p| std::path::Path::new(p).exists())
+    .map(|p| p.to_string());
+
+    if !already_preloaded {
+        let exe = match std::env::current_exe() {
+            Ok(e) => e,
+            Err(_) => return,
+        };
+        let args: Vec<String> = std::env::args().skip(1).collect();
+        log::info!("[startup] Linux: re-exec with LD_PRELOAD={preload}");
+        let mut cmd = std::process::Command::new(&exe);
+        cmd.args(args)
+            .env("LD_PRELOAD", &preload)
+            .env("LIBGL_ALWAYS_SOFTWARE", "1")
+            .env("__GLX_VENDOR_LIBRARY_NAME", "mesa")
+            .env("GDK_BACKEND", "x11")
+            .env("WEBKIT_DISABLE_COMPOSITING_MODE", "1")
+            .env("WEBKIT_DISABLE_DMABUF_RENDERER", "1")
+            .env(SENTINEL, "1");
+        if let Some(json) = &egl_vendor_json {
+            cmd.env("__EGL_VENDOR_LIBRARY_FILENAMES", json);
+        }
+        match cmd.status() {
+            Ok(s) => std::process::exit(s.code().unwrap_or(0)),
+            // If spawning failed (read-only /proc, sandbox, etc.) fall through
+            // and continue in-process below; best-effort only.
+            Err(_) => {}
+        }
+    }
+
+    // In-process fallback (also covers the sentinel'd second instance): make
+    // sure the WebKitGTK workarounds are always present regardless of how the
+    // app was started (terminal, .desktop, deb/rpm/AppImage alike).
+    unsafe {
+        if std::env::var("WEBKIT_DISABLE_COMPOSITING_MODE").is_err() {
+            std::env::set_var("WEBKIT_DISABLE_COMPOSITING_MODE", "1");
+        }
+        if std::env::var("WEBKIT_DISABLE_DMABUF_RENDERER").is_err() {
+            std::env::set_var("WEBKIT_DISABLE_DMABUF_RENDERER", "1");
+        }
+        if std::env::var("GDK_BACKEND").is_err() {
+            std::env::set_var("GDK_BACKEND", "x11");
+        }
     }
 }
 
@@ -128,24 +156,11 @@ fn relaunch_for_mesa_egl() {
 pub fn run() {
     #[cfg(target_os = "linux")]
     {
-        relaunch_for_mesa_egl();
-        if std::env::var("GDK_BACKEND").is_err() {
-            unsafe { std::env::set_var("GDK_BACKEND", "x11") };
-        }
-        // WebKitGTK blank-screen workarounds: these env vars were previously
-        // injected only through the DEB/RPM desktop template
-        // (`Exec=env WEBKIT_DISABLE_...`), which is NOT used by the AppImage
-        // bundle (its .desktop file is generated by linuxdeploy). Setting them
-        // here guarantees the WebView renders correctly in every bundle format
-        // (deb, rpm, AppImage) regardless of how the app was launched.
-        unsafe {
-            if std::env::var("WEBKIT_DISABLE_COMPOSITING_MODE").is_err() {
-                std::env::set_var("WEBKIT_DISABLE_COMPOSITING_MODE", "1");
-            }
-            if std::env::var("WEBKIT_DISABLE_DMABUF_RENDERER").is_err() {
-                std::env::set_var("WEBKIT_DISABLE_DMABUF_RENDERER", "1");
-            }
-        }
+        // NOTE: relaunch_for_gl_fix() MUST stay the very first thing on Linux —
+        // it re-execs the process before any GTK/GL context is created (see
+        // doc comment; replaces the old AppImage-only relaunch_for_mesa_egl
+        // gate that left deb/rpm users with the grey-screen EGL crash).
+        relaunch_for_gl_fix();
     }
 
     // Init script is now built by window::build_init_script() for consistency
@@ -167,6 +182,19 @@ pub fn run() {
             use tokio::sync::Mutex;
             let state: mcp::McpState = Arc::new(Mutex::new(None));
             app.manage(state);
+
+            // Window/taskbar icon fix (v2.2.9 "ícone incorreto"): GTK resolves
+            // the window icon from gtk_window_set_icon_list, which Tauri only
+            // populates when defaultWindowIcon is set or set_window_icon runs.
+            // Without it, X11/Wayland show a generic/incorrect icon even though
+            // the hicolor PNGs ship correctly in deb/rpm/AppImage bundles.
+            #[cfg(target_os = "linux")]
+            if let Some(icon) = app.default_window_icon().cloned() {
+                for w in app.webview_windows().values() {
+                    let _ = w.set_window_icon(Some(icon.clone()));
+                }
+            }
+
             events::setup_event_forwarding(app.handle());
 
             // Deep-link disabled: auth now handled inside WebView (no external browser)
