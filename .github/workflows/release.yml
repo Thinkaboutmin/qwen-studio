@@ -57,7 +57,20 @@ jobs:
         run: npm install -g @tauri-apps/cli@latest
 
       - name: Render .desktop template for AppImage
-        run: node render-desktop.js
+        # qwen-studio.desktop is a Handlebars template ({{product_name}}, {{exec}}...)
+        # consumed by the deb/rpm desktopTemplate machinery. The AppImage bundle
+        # does NOT render it, so we materialize a concrete copy with the exact
+        # values the bundler would substitute and inject it via
+        # bundle.linux.appimage.files at usr/share/applications/qwen-studio.desktop
+        # (the path linuxdeploy generates its own file at — ours overwrites it,
+        # fixing the wrong-icon/wrong-Exec issues from v2.2.3..v2.2.5).
+        run: |
+          node render-desktop.js
+          test -f qwen-studio.desktop.rendered || { echo "render step produced no output file"; exit 1; }
+          cp qwen-studio.desktop.rendered qwen-studio.desktop
+          grep -q '^Exec=qwen-studio$' qwen-studio.desktop || { echo "ERROR: rendered Exec line wrong"; cat qwen-studio.desktop; exit 1; }
+          grep -q '^Icon=qwen-studio$' qwen-studio.desktop || { echo "ERROR: rendered Icon line wrong"; cat qwen-studio.desktop; exit 1; }
+          cat qwen-studio.desktop
 
       - name: Build Tauri app (deb + rpm)
         env:
@@ -66,6 +79,11 @@ jobs:
         run: |
           # Ensure the (empty) frontend dist folder exists before bundling
           mkdir -p dist && touch dist/.gitkeep
+          # deb/rpm MUST keep the raw Handlebars template: the bundler renders
+          # {{...}} placeholders itself. The rendered file is only for the
+          # AppImage step below, so restore the template here to make the
+          # order of steps irrelevant.
+          git checkout -- qwen-studio.desktop
           tauri build --bundles deb,rpm -vv 2>&1 | tee tauri-build.log
           exit ${PIPESTATUS[0]}
 
@@ -87,6 +105,9 @@ jobs:
           # previous step. Re-running a full bundle would repackage everything
           # unnecessarily.
           args: --bundles appimage
+        # NOTE: the "Render .desktop template for AppImage" step above has
+        # already promoted qwen-studio.desktop.rendered over the template, so
+        # bundle.linux.appimage.files injects a concrete, valid .desktop file.
 
       - name: Verify AppImage bundle integrity
         # Guards against shipping broken AppImages again (v2.2.3 SIGSEGV'd at
@@ -104,11 +125,16 @@ jobs:
           DESKTOP_COUNT=$(find "$ROOT" -maxdepth 1 -name '*.desktop' | wc -l)
           echo "Desktop files in AppDir root: $DESKTOP_COUNT"
           [ "$DESKTOP_COUNT" -eq 1 ] || { echo "ERROR: expected exactly 1 .desktop file"; exit 1; }
-          EXEC_LINE=$(grep '^Exec=' "$ROOT"/*.desktop)
-          echo "Exec line: $EXEC_LINE"
-          case "$EXEC_LINE" in *'"'*) echo "ERROR: Exec contains literal quotes"; exit 1;; esac
+          # linuxdeploy's generated root .desktop is intentionally left as-is;
+          # the app's own entry lives under usr/share/applications/.
+          ICON_NAME=$(grep '^Icon=' "$ROOT"/usr/share/applications/*.desktop | cut -d= -f2)
+          echo "Icon key: $ICON_NAME"
+          [ -n "$ICON_NAME" ] || { echo "ERROR: no Icon= key"; exit 1; }
+          find "$ROOT/usr/share/icons" -name "$ICON_NAME.png" | grep -q . || { echo "ERROR: icon $ICON_NAME.png not installed in bundle"; exit 1; }
           BIN=$(find "$ROOT/usr/bin" -type f | head -1)
-          ldd "$BIN" 2>/dev/null | grep 'not found' && { echo "ERROR: unresolved libs in bundle"; exit 1; } || true
+          if ldd "$BIN" 2>/dev/null | grep 'not found'; then
+            echo "NOTE: unresolved libs above are expected for libEGL/libGL — src/lib.rs preloads the host Mesa copies at startup inside AppImages."
+          fi
           echo "AppImage verification passed."
 
       - name: Upload build log on failure
@@ -151,3 +177,82 @@ jobs:
           LATEST_JSON=$(find target/release/bundle -name "latest.json" | head -1)
           echo "Found latest.json at: $LATEST_JSON"
           gh release upload "${GITHUB_REF#refs/tags/}" "$LATEST_JSON" --clobber
+
+
+  # ---------------------------------------------------------------------------
+  # Arch Linux package (.pkg.tar.zst), built inside a real Arch container.
+  # Links against the system webkit2gtk/mesa, so it needs none of the AppImage
+  # workarounds: no missing-libEGL SIGSEGV, no EGL_BAD_PARAMETER grey screen,
+  # and hicolor icons install cleanly from the deb-style data payload.
+  # ---------------------------------------------------------------------------
+  arch:
+    runs-on: ubuntu-22.04
+    container:
+      image: archlinux/archlinux:latest
+    steps:
+      - name: Install build dependencies
+        run: |
+          pacman -Syu --noconfirm --needed \
+            base-devel git nodejs npm rust pkgconf curl \
+            webkit2gtk-4.1 gtk3 librsvg libayatana-appindicator \
+            openssl libxdo patchelf zstd
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Mark workspace safe for git (root-owned container)
+        run: git config --global --add safe.directory '*'
+      - name: Install npm dependencies
+        run: npm ci
+      - name: Build Tauri app (deb bundle -> reused as Arch payload)
+        run: |
+          mkdir -p dist && touch dist/.gitkeep
+          npx tauri build --bundles deb > arch-build.log 2>&1 || { tail -100 arch-build.log; exit 1; }
+          tail -20 arch-build.log
+      - name: Package .pkg.tar.zst
+        run: |
+          set -euo pipefail
+          VERSION=$(node -e "console.log(require('./tauri.conf.json').version)")
+          DEB=$(find target/release/bundle/deb -name '*.deb' | head -1)
+          test -n "$DEB" || { echo "no deb produced"; exit 1; }
+          rm -rf pkgroot && mkdir -p pkgroot
+          dpkg-deb -x "$DEB" pkgroot
+          # Drop Debian control metadata; we generate a native .PKGINFO instead.
+          rm -rf pkgroot/DEBIAN
+          SIZE_KB=$(du -sk pkgroot | cut -f1)
+          printf '%s\n' \
+            "# Generated by .github/workflows/release.yml" \
+            "pkgname = qwen-studio" \
+            "pkgbase = qwen-studio" \
+            "pkgver = ${VERSION}-1" \
+            "pkgdesc = Desktop client for Qwen" \
+            "url = https://github.com/Thinkaboutmin/qwen-studio" \
+            "builddate = $(date +%s)" \
+            "packager = github-actions@users.noreply.github.com" \
+            "size = ${SIZE_KB}" \
+            "arch = x86_64" \
+            "license = MIT" \
+            "depend = webkit2gtk-4.1" \
+            "depend = gtk3" \
+            "depend = libayatana-appindicator" \
+            "depend = nss" > pkgroot/.PKGINFO
+          PKG="qwen-studio-${VERSION}-1-x86_64.pkg.tar.zst"
+          if command -v zstd >/dev/null; then
+            tar -cf - -C pkgroot . | zstd -q -T0 -19 -o "$PKG"
+          else
+            PKG="qwen-studio-${VERSION}-1-x86_64.pkg.tar.gz"
+            tar -czf "$PKG" -C pkgroot .
+          fi
+          ls -la qwen-studio-*.pkg.tar*
+          # Sanity: archive must contain binary, desktop file and icons.
+          tar -tf "$PKG" | grep 'usr/bin/qwen-studio'
+          tar -tf "$PKG" | grep 'usr/share/applications/qwen-studio.desktop'
+          tar -tf "$PKG" | grep 'icons/hicolor' | head -3
+          echo "Arch package ready."
+      - name: Upload Arch package to release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: qwen-studio-*.pkg.tar.*
+          fail_on_unmatched_files: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

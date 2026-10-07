@@ -13,53 +13,107 @@ fn setup_gtk_drag_drop(_app: &tauri::AppHandle) {
     log::info!("[DragDrop] Events will be forwarded via Tauri window events");
 }
 
-/// AppImage SIGSEGV fix (re-exec stage). linuxdeploy's gtk plugin does not
-/// copy libEGL.so.1 into the bundle (it only ships libwayland-egl.so.1), so
-/// inside the AppDir `ldd usr/bin/qwen-studio` reports
-/// "libEGL.so.1 => not found" and the dynamic loader kills the process with
-/// SIGSEGV *before main() runs* — meaning in-process env fixes are useless
-/// for that launch. The only reliable cure is to re-exec ourselves once with
-/// LD_PRELOAD pointing at the host's libEGL.so.1 (always present on systems
-/// that can run WebKitGTK apps). The sentinel env var prevents loops, and the
-/// whole block is a no-op when libEGL cannot be found or we are not running
-/// under an AppImage (deb/rpm keep working untouched).
+/// Locate the system Mesa OpenGL/EGL provider libraries.
+///
+/// Background: linuxdeploy's gtk plugin does not copy libEGL.so.1/libGL.so.1
+/// into the AppImage bundle, and the bundled gstreamer/media libs drag in an
+/// old host `libcuda.so.1` stub. When WebKitGTK's GPU process then calls
+/// `eglGetDisplay(EGL_DEFAULT_DISPLAY)` it gets `EGL_BAD_PARAMETER` back from
+/// the NVIDIA/CUDA driver path and the process aborts ("Could not create
+/// default EGL display: EGL_BAD_PARAMETER. Aborting..." -> grey window).
+/// Searching the standard multiarch dirs lets us both detect that situation
+/// and preload the correct Mesa providers on top of the broken ones.
 #[cfg(target_os = "linux")]
-fn relaunch_with_libegl_preloaded() {
-    const SENTINEL: &str = "QWEN_STUDIO_LIBEGL_RELAUNCHED";
-    if std::env::var(SENTINEL).is_ok() {
-        return; // already relaunched; proceed normally
-    }
-    let needs_egl = std::env::var("LD_PRELOAD")
-        .map(|v| !v.contains("libEGL"))
-        .unwrap_or(true);
-    if !needs_egl {
+fn find_system_mesa_lib(name: &str) -> Option<String> {
+    const DIRS: &[&str] = &[
+        "/usr/lib/x86_64-linux-gnu",
+        "/usr/lib64",
+        "/usr/lib",
+        "/usr/lib/mesa",
+        "/usr/lib/mesa-libgl",
+        "/usr/lib32",
+    ];
+    DIRS.iter()
+        .map(|d| format!("{d}/{name}"))
+        .find(|p| std::path::Path::new(p).exists())
+}
+
+/// AppImage GL/EGL startup fix (single re-exec).
+///
+/// Two problems are solved at once, both requiring action *before* any GL
+/// context is created (hence the re-exec; in-process env changes would come
+/// too late for the dynamic loader and for WebKit's GPU process):
+///
+///  1. The bundle lacks libEGL.so.1 entirely. We LD_PRELOAD the host's Mesa
+///     libEGL.so.1 + libGL.so.1 so resolution succeeds and, crucially, so the
+///     *Mesa* implementations win symbol lookup over the stale CUDA/NVIDIA
+///     libs pulled in by the bundled media framework (which caused
+///     EGL_BAD_PARAMETER aborts and the grey screen in v2.2.5).
+///  2. WebKitGTK spawns its Network/Web/GPU processes via execvp *inheriting
+///     our environment*. LD_PRELOAD propagates to those children automatically,
+///     which is why preloading beats setting LIBGL_* env vars alone.
+///
+/// Safety: the function is a complete no-op unless ALL of these hold —
+/// we are inside an AppImage (APPDIR set), the binary actually has an
+/// unresolved libEGL.so.1 dependency, and a system Mesa libEGL exists.
+/// deb/rpm packages (where the system linker resolves libEGL normally) are
+/// never relaunched. A sentinel env var guarantees at most one re-exec.
+#[cfg(target_os = "linux")]
+fn relaunch_for_mesa_egl() {
+    const SENTINEL: &str = "QWEN_STUDIO_MESA_RELAUNCHED";
+    // Only act inside an AppImage mount (deb/rpm never set APPDIR).
+    if std::env::var("APPDIR").is_err() || std::env::var(SENTINEL).is_ok() {
         return;
     }
-    const CANDIDATES: &[&str] = &[
-        "/usr/lib/x86_64-linux-gnu/libEGL.so.1",
-        "/usr/lib64/libEGL.so.1",
-        "/usr/lib/libEGL.so.1",
-        "/usr/lib/i386-linux-gnu/libEGL.so.1",
-    ];
-    let egl = match CANDIDATES.iter().find(|p| std::path::Path::new(p).exists()) {
-        Some(p) => (*p).to_string(),
-        None => return, // unusual system: don't touch anything
+    // Already preloading some libEGL? Leave the user's setup alone.
+    if std::env::var("LD_PRELOAD")
+        .map(|v| v.contains("libEGL"))
+        .unwrap_or(false)
+    {
+        return;
+    }
+    // Verify the bundle genuinely fails to resolve libEGL (mirrors the
+    // missing-library condition that produced the v2.2.3/v2.2.5 crashes).
+    let ldd_ok = std::process::Command::new("ldd")
+        .arg(std::env::current_exe().unwrap_or_default())
+        .output()
+        .map(|o| {
+            String::from_utf8_lossy(&o.stdout)
+                .lines()
+                .any(|l| l.contains("libEGL.so.1") && l.contains("not found"))
+        })
+        .unwrap_or(false);
+    if !ldd_ok {
+        return;
+    }
+    let egl = match find_system_mesa_lib("libEGL.so.1") {
+        Some(p) => p,
+        None => return, // no Mesa available: don't touch anything
     };
-    let mut preload = egl.clone();
+    let mut preload_parts: Vec<String> = Vec::new();
     if let Ok(prev) = std::env::var("LD_PRELOAD") {
         if !prev.is_empty() {
-            preload = format!("{prev} {egl}");
+            preload_parts.push(prev);
         }
     }
+    preload_parts.push(egl.clone());
+    if let Some(gl) = find_system_mesa_lib("libGL.so.1") {
+        preload_parts.push(gl);
+    }
+    let preload = preload_parts.join(" ");
     let exe = match std::env::current_exe() {
         Ok(e) => e,
         Err(_) => return,
     };
     let args: Vec<String> = std::env::args().skip(1).collect();
-    log::info!("[startup] re-exec with LD_PRELOAD={preload}");
+    log::info!("[startup] AppImage: re-exec with LD_PRELOAD={preload}");
     let status = std::process::Command::new(exe)
         .args(args)
-        .env("LD_PRELOAD", preload)
+        .env("LD_PRELOAD", &preload)
+        // Belt-and-braces: force Mesa/GLVND dispatch and software fallback for
+        // the GPU process even if a vendor driver still interferes.
+        .env("LIBGL_ALWAYS_SOFTWARE", "1")
+        .env("__GLX_VENDOR_LIBRARY_NAME", "mesa")
         .env(SENTINEL, "1")
         .status();
     match status {
@@ -74,7 +128,7 @@ fn relaunch_with_libegl_preloaded() {
 pub fn run() {
     #[cfg(target_os = "linux")]
     {
-        relaunch_with_libegl_preloaded();
+        relaunch_for_mesa_egl();
         if std::env::var("GDK_BACKEND").is_err() {
             unsafe { std::env::set_var("GDK_BACKEND", "x11") };
         }

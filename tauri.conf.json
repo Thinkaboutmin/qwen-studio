@@ -1,7 +1,7 @@
 {
   "$schema": "./node_modules/@tauri-apps/cli/config.schema.json",
   "productName": "Qwen Studio",
-  "version": "2.2.5",
+  "version": "2.2.6",
   "identifier": "com.qwen.studio",
   "build": {
     "frontendDist": "./dist",
@@ -29,7 +29,10 @@
     ],
     "linux": {
       "appimage": {
-        "bundleMediaFramework": true
+        "bundleMediaFramework": true,
+        "files": {
+          "usr/share/applications/qwen-studio.desktop": "qwen-studio.desktop"
+        }
       },
       "deb": {
         "depends": [

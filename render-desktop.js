@@ -1,22 +1,39 @@
-// Sanitize qwen-studio.desktop so it is valid for the deb/rpm desktopTemplate
-// consumers (debhelper/lintian and rpmbuild). The bundler renders {{...}}
-// placeholders itself via handlebars when generating .deb/.rpm, so this script
-// only fixes structural issues:
-//  - removes the shebang line (invalid inside a [Desktop Entry] file)
-//  - unquotes the Exec placeholder: the bundler substitutes {{exec}} with the
-//    real binary name ("qwen-studio"); literal quotes around it make AppRun's
-//    desktop-file parser exec a nonexistent command -> SIGSEGV on launch.
-// It intentionally does NOT touch the file for AppImage builds anymore: the
-// AppImage gets its own generated desktop file from linuxdeploy (which points
-// Exec at the correct binary), so we no longer inject ours via
-// bundle.linux.appimage.files (that used to produce TWO conflicting .desktop
-// files in the AppDir root).
+// Render qwen-studio.desktop (a Handlebars template used verbatim by the
+// deb/rpm desktopTemplate machinery, which the bundler renders itself) into a
+// concrete .desktop file for the AppImage bundle.
+//
+// Why: the AppImage path does NOT apply `desktopTemplate` — linuxdeploy
+// generates its own usr/share/applications/<name>.desktop, which historically
+// produced the wrong Icon and an unusable Exec for this app. We therefore
+// render our own file here and inject it via bundle.linux.appimage.files at
+// exactly that path so it overwrites linuxdeploy's output.
+//
+// Values mirror what the Rust bundler substitutes at build time:
+//   {{product_name}} -> productName ("Qwen Studio")
+//   {{comment}}      -> app description
+//   {{exec}}/{{icon}}-> main binary name ("qwen-studio"; unquoted — quoted
+//                      Exec lines caused the v2.2.3 SIGSEGV)
 const fs = require("fs");
 const path = require("path");
 
+const vars = {
+  product_name: "Qwen Studio",
+  comment: "Desktop client for Qwen",
+  exec: "qwen-studio",
+  icon: "qwen-studio",
+};
+
 const file = path.join(__dirname, "qwen-studio.desktop");
 let s = fs.readFileSync(file, "utf8");
-s = s.replace(/^#![^\n]*\n/, ""); // drop shebang
-s = s.replace(/Exec="\{\{exec\}\}"/g, "Exec={{exec}}"); // unquote placeholder
-fs.writeFileSync(file, s);
-console.log("Sanitized qwen-studio.desktop:\n" + s);
+s = s.replace(/^#![^\n]*\n/, ""); // drop shebang (invalid in a .desktop file)
+s = s.replace(/\{\{(\w+)\}\}/g, (_, k) => {
+  if (!(k in vars)) throw new Error(`render-desktop.js: unknown placeholder {{${k}}}`);
+  return vars[k];
+});
+if (/^Exec=.*".*$/m.test(s)) {
+  throw new Error("render-desktop.js: Exec line contains literal quotes");
+}
+// Written to a separate file so the template stays intact in git and CI can
+// verify + promote it before bundling.
+fs.writeFileSync(path.join(__dirname, "qwen-studio.desktop.rendered"), s);
+console.log("Rendered qwen-studio.desktop.rendered:\n" + s);
