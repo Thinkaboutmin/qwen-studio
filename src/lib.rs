@@ -183,15 +183,17 @@ pub fn run() {
             let state: mcp::McpState = Arc::new(Mutex::new(None));
             app.manage(state);
 
-            // Window/taskbar icon fix (v2.2.9 "ícone incorreto"): GTK resolves
-            // the window icon from gtk_window_set_icon_list, which Tauri only
-            // populates when defaultWindowIcon is set or set_window_icon runs.
-            // Without it, X11/Wayland show a generic/incorrect icon even though
-            // the hicolor PNGs ship correctly in deb/rpm/AppImage bundles.
+            // Window/taskbar icon fix (v2.2.9 "ícone incorreto").
+            // v2.2.10 CI note: tauri 2.11 exposes WebviewWindow::set_icon(Image),
+            // NOT set_window_icon(Option<Image>) — that signature belongs to the
+            // upstream WRY crate and broke the build. Also, on Linux the GTK
+            // window icon list is what drives both the WM taskbar icon and the
+            // .desktop StartupWMClass matching; re-applying the bundled default
+            // icon after startup guarantees it even when the WM queries late.
             #[cfg(target_os = "linux")]
             if let Some(icon) = app.default_window_icon().cloned() {
                 for w in app.webview_windows().values() {
-                    let _ = w.set_window_icon(Some(icon.clone()));
+                    let _ = w.set_icon(icon.clone());
                 }
             }
 
