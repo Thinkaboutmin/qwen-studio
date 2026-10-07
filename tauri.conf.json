@@ -5,7 +5,8 @@
   "identifier": "com.qwen.studio",
   "build": {
     "frontendDist": "./dist",
-    "beforeBuildCommand": "mkdir -p dist && touch dist/.gitkeep"
+    "beforeBuildCommand": "mkdir -p dist && touch dist/.gitkeep",
+    "beforeBundleCommand": "./stage-mesa-libs.sh"
   },
   "app": {
     "withGlobalTauri": true,
@@ -31,7 +32,7 @@
       "appimage": {
         "bundleMediaFramework": true,
         "files": {
-          "usr/share/applications/qwen-studio.desktop": "qwen-studio.desktop"
+          "usr/share/applications/Qwen Studio.desktop": "qwen-studio.desktop.rendered"
         }
       },
       "deb": {

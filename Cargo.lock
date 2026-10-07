@@ -3119,7 +3119,7 @@ dependencies = [
 
 [[package]]
 name = "qwen-studio"
-version = "2.2.3"
+version = "2.2.7"
 dependencies = [
  "anyhow",
  "base64 0.22.1",

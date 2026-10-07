@@ -3,3 +3,4 @@ dist/
 target/
 patches/
 *.AppImage
+qwen-studio.desktop.rendered

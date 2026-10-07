@@ -58,19 +58,20 @@ jobs:
 
       - name: Render .desktop template for AppImage
         # qwen-studio.desktop is a Handlebars template ({{product_name}}, {{exec}}...)
-        # consumed by the deb/rpm desktopTemplate machinery. The AppImage bundle
-        # does NOT render it, so we materialize a concrete copy with the exact
-        # values the bundler would substitute and inject it via
-        # bundle.linux.appimage.files at usr/share/applications/qwen-studio.desktop
-        # (the path linuxdeploy generates its own file at — ours overwrites it,
-        # fixing the wrong-icon/wrong-Exec issues from v2.2.3..v2.2.5).
+        # consumed by the deb/rpm desktopTemplate machinery, which the bundler
+        # renders itself. The AppImage path does NOT apply desktopTemplate —
+        # linuxdeploy generates its own usr/share/applications/<productName>.desktop
+        # with a quoted Exec and a wrong Icon (the SIGSEGV/grey-icon regressions of
+        # v2.2.3..v2.2.6). We materialize a concrete copy here; it is injected via
+        # bundle.linux.appimage.files at exactly linuxdeploy's output path so ours
+        # overwrites theirs. The template file itself stays untouched in git so the
+        # deb/rpm builds keep receiving the raw placeholders.
         run: |
           node render-desktop.js
           test -f qwen-studio.desktop.rendered || { echo "render step produced no output file"; exit 1; }
-          cp qwen-studio.desktop.rendered qwen-studio.desktop
-          grep -q '^Exec=qwen-studio$' qwen-studio.desktop || { echo "ERROR: rendered Exec line wrong"; cat qwen-studio.desktop; exit 1; }
-          grep -q '^Icon=qwen-studio$' qwen-studio.desktop || { echo "ERROR: rendered Icon line wrong"; cat qwen-studio.desktop; exit 1; }
-          cat qwen-studio.desktop
+          grep -q '^Exec=qwen-studio$' qwen-studio.desktop.rendered || { echo "ERROR: rendered Exec line wrong"; cat qwen-studio.desktop.rendered; exit 1; }
+          grep -q '^Icon=qwen-studio$' qwen-studio.desktop.rendered || { echo "ERROR: rendered Icon line wrong"; cat qwen-studio.desktop.rendered; exit 1; }
+          cat qwen-studio.desktop.rendered
 
       - name: Build Tauri app (deb + rpm)
         env:
@@ -79,47 +80,12 @@ jobs:
         run: |
           # Ensure the (empty) frontend dist folder exists before bundling
           mkdir -p dist && touch dist/.gitkeep
-          # deb/rpm MUST keep the raw Handlebars template: the bundler renders
-          # {{...}} placeholders itself. The rendered file is only for the
-          # AppImage step below, so restore the template here to make the
-          # order of steps irrelevant.
-          git checkout -- qwen-studio.desktop
-          tauri build --bundles deb,rpm -vv 2>&1 | tee tauri-build.log
+          # The global beforeBundleCommand (stage-mesa-libs.sh) also runs for
+          # deb/rpm. Exporting APPDIR to a directory WITHOUT usr/bin makes the
+          # hook detect "not an AppImage AppDir" and no-op cleanly.
+          mkdir -p target/non-appdir
+          APPDIR="$PWD/target/non-appdir" tauri build --bundles deb,rpm -vv 2>&1 | tee tauri-build.log
           exit ${PIPESTATUS[0]}
-
-      - name: Patch linuxdeploy-plugin-gtk.sh to copy Mesa EGL/GL into the bundle
-        # Root cause of the grey screen (EGL_BAD_PARAMETER) and SIGSEGV in
-        # v2.2.3..v2.2.5: the gtk plugin copies GTK/pixbuf libs but NEVER
-        # libEGL.so.1/libGL.so.1, and bundleMediaFramework drags gstreamer
-        # libs whose rpath resolves an old CUDA/NVIDIA stub on real hosts.
-        # We append a block to the plugin script that linuxdeploy downloads
-        # at build time (cached under ~/.cache/linuxdeploy): if the AppDir
-        # ends up without libEGL.so.1, copy the system Mesa providers into
-        # usr/lib. AppRun's LD_LIBRARY_PATH=$APPDIR/usr/lib then resolves
-        # them for the main process AND all WebKitGTK GPU child processes.
-        run: |
-          set -euo pipefail
-          PLUGIN=$(find "$HOME/.cache/linuxdeploy" -name 'linuxdeploy-plugin-gtk.sh' 2>/dev/null | head -1 || true)
-          if [ -z "$PLUGIN" ]; then
-            mkdir -p "$HOME/.cache/linuxdeploy"
-            PLUGIN="$HOME/.cache/linuxdeploy/linuxdeploy-plugin-gtk.sh"
-            curl -sSL -o "$PLUGIN" https://raw.githubusercontent.com/tauri-apps/linuxdeploy-plugin-gtk/master/linuxdeploy-plugin-gtk.sh
-            chmod +x "$PLUGIN"
-          fi
-          cat >> "$PLUGIN" <<'EOF'
-
-          # --- qwen-studio CI patch: stage Mesa EGL/GL into the bundle ---
-          if ! find "$APPDIR/usr" -name 'libEGL.so.1' 2>/dev/null | grep -q .; then
-            echo "[gtk-plugin/qwen] staging system Mesa EGL/GL into $APPDIR/usr/lib"
-            mkdir -p "$APPDIR/usr/lib"
-            for n in libEGL.so.1 libGL.so.1; do
-              for d in /usr/lib/x86_64-linux-gnu /usr/lib64 /usr/lib /usr/lib/mesa /usr/lib/mesa-libgl; do
-                if [ -e "$d/$n" ]; then cp -L "$d/$n" "$APPDIR/usr/lib/" && break; fi
-              done
-            done
-          fi
-          EOF
-          echo "Patched $PLUGIN:"; tail -15 "$PLUGIN"
 
       - name: Build Tauri app (AppImage)
         uses: tauri-apps/tauri-action@v0
@@ -139,9 +105,9 @@ jobs:
           # previous step. Re-running a full bundle would repackage everything
           # unnecessarily.
           args: --bundles appimage
-        # NOTE: the "Render .desktop template for AppImage" step above has
-        # already promoted qwen-studio.desktop.rendered over the template, so
-        # bundle.linux.appimage.files injects a concrete, valid .desktop file.
+        # NOTE: Mesa libEGL/libGL are staged into the AppDir by the
+        # beforeBundleCommand hook (stage-mesa-libs.sh), which the bundler runs
+        # from inside the AppDir right before invoking linuxdeploy.
 
       - name: Verify AppImage bundle integrity
         # Guards against shipping broken AppImages again (v2.2.3 SIGSEGV'd at
@@ -156,12 +122,16 @@ jobs:
           APPIMAGE_EXTRACT_AND_RUN=1 "$APPIMAGE" --appimage-extract >/dev/null
           cd squashfs-root && mv "$(pwd)" /tmp/verify-appdir && cd /
           ROOT=/tmp/verify-appdir
-          DESKTOP_COUNT=$(find "$ROOT" -maxdepth 1 -name '*.desktop' | wc -l)
-          echo "Desktop files in AppDir root: $DESKTOP_COUNT"
-          [ "$DESKTOP_COUNT" -eq 1 ] || { echo "ERROR: expected exactly 1 .desktop file"; exit 1; }
-          # linuxdeploy's generated root .desktop is intentionally left as-is;
-          # the app's own entry lives under usr/share/applications/.
-          ICON_NAME=$(grep '^Icon=' "$ROOT"/usr/share/applications/*.desktop | cut -d= -f2)
+          DESKTOP_COUNT=$(find "$ROOT" -name '*.desktop' | wc -l)
+          echo "Total .desktop files in bundle: $DESKTOP_COUNT"
+          [ "$DESKTOP_COUNT" -eq 1 ] || { echo "ERROR: expected exactly 1 .desktop file:"; find "$ROOT" -name '*.desktop'; exit 1; }
+          # The injected entry must live at linuxdeploy's canonical path
+          # (<productName>.desktop) so it overwrote the generated one.
+          INJECTED="$ROOT/usr/share/applications/Qwen Studio.desktop"
+          test -f "$INJECTED" || { echo "ERROR: injected desktop file missing at $INJECTED"; find "$ROOT" -name '*.desktop'; exit 1; }
+          grep -q '^Exec=qwen-studio$' "$INJECTED" || { echo "ERROR: bad Exec line:"; cat "$INJECTED"; exit 1; }
+          grep -q '^Icon=qwen-studio$' "$INJECTED" || { echo "ERROR: bad Icon line:"; cat "$INJECTED"; exit 1; }
+          ICON_NAME=$(grep '^Icon=' "$INJECTED" | cut -d= -f2)
           echo "Icon key: $ICON_NAME"
           [ -n "$ICON_NAME" ] || { echo "ERROR: no Icon= key"; exit 1; }
           find "$ROOT/usr/share/icons" -name "$ICON_NAME.png" | grep -q . || { echo "ERROR: icon $ICON_NAME.png not installed in bundle"; exit 1; }

@@ -1,6 +1,6 @@
 [package]
 name = "qwen-studio"
-version = "2.2.3"
+version = "2.2.7"
 description = "Open-source Qwen AI desktop client with MCP support"
 authors = ["youssefvdel"]
 license = "MIT"
