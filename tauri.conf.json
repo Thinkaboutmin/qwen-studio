@@ -1,7 +1,7 @@
 {
   "$schema": "./node_modules/@tauri-apps/cli/config.schema.json",
   "productName": "Qwen Studio",
-  "version": "2.2.7",
+  "version": "2.2.9",
   "identifier": "com.qwen.studio",
   "build": {
     "frontendDist": "./dist",
@@ -10,6 +10,19 @@
   },
   "app": {
     "withGlobalTauri": true,
+    "windows": [
+      {
+        "title": "Qwen Studio",
+        "width": 1280,
+        "height": 800,
+        "minWidth": 800,
+        "minHeight": 600,
+        "resizable": true,
+        "fullscreen": false,
+        "decorations": false,
+        "url": "https://chat.qwen.ai"
+      }
+    ],
     "security": {
       "csp": null
     }
@@ -32,7 +45,7 @@
       "appimage": {
         "bundleMediaFramework": true,
         "files": {
-          "usr/share/applications/Qwen Studio.desktop": "qwen-studio.desktop.rendered"
+          "usr/share/applications/qwen-studio.desktop": "qwen-studio.desktop.rendered"
         }
       },
       "deb": {
