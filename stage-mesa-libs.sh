@@ -46,6 +46,56 @@ for n in libEGL.so.1 libGL.so.1; do
     fi
   done
 done
+# v2.2.14 HARD GUARD: linuxdeploy's gtk plugin never copies libEGL.so.1 into
+# the AppDir, so without this hook the shipped binary has an unresolved
+# DT_NEEDED on libEGL.so.1 and SIGSEGVs at load on hosts whose loader search
+# paths miss it too (openSUSE Tumbleweed — every release v2.2.9..v2.2.13 was
+# affected because staging silently no-op'd on the Ubuntu runner). If the
+# library still isn't in the bundle after the copy attempts above, download
+# the full *working* runtime closure of libglvnd EGL dispatch via apt
+# (libegl1 + libglvnd0 + libegl-mesa0 + mesa deps) and unpack them into
+# usr/lib by hand. NOTE: we deliberately ship only the libglvnd dispatchers +
+# Mesa; the host still supplies the DRI driver through /usr/lib/dri at
+# runtime, and LIBGL_ALWAYS_SOFTWARE (set by src/lib.rs) keeps even that
+# optional.
+if ! find "$APPDIR/usr/lib" -name 'libEGL.so.1' | grep -q .; then
+  echo "[stage-mesa] libEGL.so.1 NOT found in system dirs — falling back to apt-get download"
+  TMPMESA="$(mktemp -d)"
+  trap 'rm -rf "$TMPMESA"' EXIT
+  ( cd "$TMPMESA" && apt-get download -y \
+      libegl1 libgl1 libglvnd0 \
+      libegl-mesa0 libgbm1 libglapi-mesa \
+      libdrm2 libexpat1 libxshmfence1 \
+      libx11-xcb1 libxcb-dri2-0 libxcb-dri3-0 libxcb-present0 \
+      libxcb-randr0 libxcb-sync1 libxcb-xfixes0 >/dev/null 2>&1 ) || true
+  for debfile in "$TMPMESA"/libegl1_*.deb "$TMPMESA"/libgl1_*.deb "$TMPMESA"/libglvnd0_*.deb \
+                 "$TMPMESA"/libegl-mesa0_*.deb "$TMPMESA"/libgbm1_*.deb "$TMPMESA"/libglapi-mesa_*.deb \
+                 "$TMPMESA"/libdrm2_*.deb "$TMPMESA"/libexpat1_*.deb "$TMPMESA"/libxshmfence1_*.deb \
+                 "$TMPMESA"/libx11-xcb1_*.deb "$TMPMESA"/libxcb-dri2-0_*.deb "$TMPMESA"/libxcb-dri3-0_*.deb \
+                 "$TMPMESA"/libxcb-present0_*.deb "$TMPMESA"/libxcb-randr0_*.deb "$TMPMESA"/libxcb-sync1_*.deb \
+                 "$TMPMESA"/libxcb-xfixes0_*.deb; do
+    [ -e "$debfile" ] || continue
+    dpkg-deb -x "$debfile" "$TMPMESA/root" || continue
+  done
+  # Copy versioned soname objects (skip unversioned .so dev symlinks).
+  while IFS= read -r f; do
+    base=$(basename "$f")
+    case "$base" in
+      *.so) continue ;;
+    esac
+    if [ ! -e "$APPDIR/usr/lib/$base" ]; then
+      cp -L "$f" "$APPDIR/usr/lib/$base"
+      echo "[stage-mesa] staged (apt) $base"
+      STAGED=$((STAGED+1))
+    fi
+  done < <(find "$TMPMESA/root" \( -name 'libEGL.so.1*' -o -name 'libGL.so.1*' -o -name 'libGLdispatch.so.0*' -o -name 'libGLESv*.so.2*' -o -name 'libEGL_mesa.so.0*' -o -name 'libgbm.so.1*' -o -name 'libglapi.so.0*' -o -name 'libdrm.so.2*' -o -name 'libexpat.so.1*' -o -name 'libxshmfence.so.1*' -o -name 'libX11-xcb.so.1*' -o -name 'libxcb-dri2.so.0*' -o -name 'libxcb-dri3.so.0*' -o -name 'libxcb-present.so.0*' -o -name 'libxcb-randr.so.0*' -o -name 'libxcb-sync.so.1*' -o -name 'libxcb-xfixes.so.0*' \) -type f 2>/dev/null)
+  rm -rf "$TMPMESA"; trap - EXIT
+fi
+if ! find "$APPDIR/usr/lib" -name 'libEGL.so.1' | grep -q .; then
+  echo "[stage-mesa] FATAL: could not stage libEGL.so.1 into the AppImage bundle."
+  echo "[stage-mesa] Refusing to ship an AppImage that SIGSEGVs at load time."
+  exit 1
+fi
 echo "[stage-mesa] complete ($STAGED/2 libs available in $APPDIR/usr/lib)"
 
 # ---------------------------------------------------------------------------

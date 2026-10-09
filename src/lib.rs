@@ -5,6 +5,9 @@ mod settings;
 mod tray;
 mod window;
 
+#[allow(unused_imports)]
+use std::path::Path;
+
 use tauri::Manager;
 
 #[cfg(target_os = "linux")]
@@ -85,16 +88,20 @@ fn appdir_root() -> Option<std::path::PathBuf> {
     std::env::var("APPDIR").ok().map(std::path::PathBuf::from)
 }
 
+/// Sentinel marking "this process is the relaunched instance" (read at the
+/// top of `relaunch_for_gl_fix` and written by every re-exec path).
+#[cfg(target_os = "linux")]
+const MESA_RELAUNCH_SENTINEL: &str = "QWEN_STUDIO_MESA_RELAUNCHED";
+
 #[cfg(target_os = "linux")]
 fn relaunch_for_gl_fix() {
-    const SENTINEL: &str = "QWEN_STUDIO_MESA_RELAUNCHED";
-    if std::env::var(SENTINEL).is_ok() {
+    if std::env::var(MESA_RELAUNCH_SENTINEL).is_ok() {
         return;
     }
-    let egl = match find_system_mesa_lib("libEGL.so.1") {
-        Some(p) => p,
-        None => return, // no Mesa available: don't touch anything
-    };
+    // NOTE: absence of host Mesa must NOT abort the whole fix — the
+    // missing-libEGL self-heal below has its own Mesa lookup and simply
+    // no-ops when nothing sane exists to preload.
+    let egl = find_system_mesa_lib("libEGL.so.1");
     // Already preloading some libEGL? Respect the user's setup but still fall
     // through to set the env vars below (no re-exec needed for that).
     let already_preloaded = std::env::var("LD_PRELOAD")
@@ -132,7 +139,9 @@ fn relaunch_for_gl_fix() {
     // CUDA/NVIDIA stub the media framework drags along.
     let in_appimage = appdir_root().is_some();
     if in_appimage {
-        preload_parts.push(egl.clone());
+        if let Some(egl) = &egl {
+            preload_parts.push(egl.clone());
+        }
         if let Some(gl) = find_system_mesa_lib("libGL.so.1") {
             preload_parts.push(gl);
         }
@@ -148,7 +157,7 @@ fn relaunch_for_gl_fix() {
     .find(|p| std::path::Path::new(p).exists())
     .map(|p| p.to_string());
 
-    if !already_preloaded && in_appimage {
+    if !already_preloaded && in_appimage && egl.is_some() {
         if let Some(exe) = relaunch_target {
             let args: Vec<String> = std::env::args().skip(1).collect();
             log::info!("[startup] AppImage: re-exec {} with LD_PRELOAD={}", exe.display(), preload);
@@ -160,9 +169,28 @@ fn relaunch_for_gl_fix() {
                 .env("GDK_BACKEND", "x11")
                 .env("WEBKIT_DISABLE_COMPOSITING_MODE", "1")
                 .env("WEBKIT_DISABLE_DMABUF_RENDERER", "1")
-                .env(SENTINEL, "1");
+                .env(MESA_RELAUNCH_SENTINEL, "1");
             if let Some(json) = &egl_vendor_json {
                 cmd.env("__EGL_VENDOR_LIBRARY_FILENAMES", json);
+            }
+            // v2.2.13 regression: the staged Mesa copies under $APPDIR/usr/lib
+            // were preferred by AppRun's LD_LIBRARY_PATH *before* any host dir,
+            // so the relaunched process resolved libEGL.so.1 to our bundled
+            // Mesa build while its dependent libs (libdrm, libexpat, ...) came
+            // from a different host generation -> SIGSEGV inside the loader,
+            // before main() even ran. Drop every path that contains a staged
+            // copy of libEGL/libGL from LD_LIBRARY_PATH for the child; the
+            // explicit LD_PRELOAD above still guarantees Mesa providers.
+            if let Ok(ldlp) = std::env::var("LD_LIBRARY_PATH") {
+                let cleaned: Vec<String> = ldlp
+                    .split(':')
+                    .map(|s| s.to_string())
+                    .filter(|p| {
+                        !(std::path::Path::new(p).join("libEGL.so.1").exists()
+                            || std::path::Path::new(p).join("libGL.so.1").exists())
+                    })
+                    .collect();
+                cmd.env("LD_LIBRARY_PATH", cleaned.join(":"));
             }
             match cmd.status() {
                 Ok(s) => std::process::exit(s.code().unwrap_or(0)),
@@ -186,6 +214,101 @@ fn relaunch_for_gl_fix() {
         if std::env::var("GDK_BACKEND").is_err() {
             std::env::set_var("GDK_BACKEND", "x11");
         }
+    }
+    // v2.2.14: last-resort self-healing for AppImages built without staged
+    // Mesa libs (v2.2.9..v2.2.13 shipped bundles where linuxdeploy's gtk
+    // plugin never copied libEGL.so.1 and CI staging silently no-op'd — the
+    // binary then has an UNRESOLVED libEGL.so.1 DT_NEEDED and dies with
+    // SIGSEGV during load on hosts whose loader search paths miss it too).
+    // If we detect exactly that situation, exec the extracted $APPDIR/AppRun
+    // one final time with the host Mesa libs explicitly preloaded. A dedicated
+    // sentinel makes this fire at most once per launch chain, so there is
+    // zero risk of a relaunch loop.
+    if in_appimage {
+        maybe_reexec_missing_libegl(&preload_parts, egl_vendor_json.as_deref());
+    }
+}
+
+/// Self-heal an AppImage whose bundle lacks libEGL.so.1 entirely (see the
+/// call site in `relaunch_for_gl_fix`). Best-effort: any failure simply
+/// returns and the normal startup continues.
+#[cfg(target_os = "linux")]
+fn maybe_reexec_missing_libegl(preload_parts: &[String], vendor_json: Option<&str>) {
+    const MISSING_EGL_SENTINEL: &str = "QWEN_STUDIO_LIBEGL_RELAUNCHED";
+    if std::env::var(MISSING_EGL_SENTINEL).is_ok() {
+        return; // already tried once — do not loop
+    }
+    let dir = match appdir_root() {
+        Some(d) => d,
+        None => return,
+    };
+    // Only act when the bundle genuinely has no EGL/GL provider anywhere.
+    let has_egl_in_bundle = ["usr/lib", "usr/lib/x86_64-linux-gnu"]
+        .iter()
+        .any(|sub| dir.join(sub).join("libEGL.so.1").exists());
+    if has_egl_in_bundle {
+        return;
+    }
+    // Cheap heuristic: run `ldd` against the real binary at usr/bin and look
+    // for an unresolved libEGL dependency. (Inside a mounted AppImage
+    // current_exe() is the FUSE runtime path, which ldd handles fine but is
+    // slower to stat through /proc — prefer the stable $APPDIR copy.)
+    let bin = dir.join("usr/bin/qwen-studio");
+    let bin_path = match bin.exists() {
+        true => bin,
+        false => match std::env::current_exe() {
+            Ok(p) => p,
+            Err(_) => return,
+        },
+    };
+    let out = match std::process::Command::new("ldd").arg(&bin_path).output() {
+        Ok(o) => o,
+        Err(_) => return,
+    };
+    let text = String::from_utf8_lossy(&out.stdout);
+    if !text.contains("libEGL.so.1 => not found") {
+        return;
+    }
+    let egl = match find_system_mesa_lib("libEGL.so.1") {
+        Some(p) => p,
+        None => return, // nothing sane to preload; leave it to the host
+    };
+    let mut parts: Vec<String> = preload_parts.to_vec();
+    if !parts.iter().any(|p| p == &egl) {
+        parts.push(egl);
+    }
+    if let Some(gl) = find_system_mesa_lib("libGL.so.1") {
+        if !parts.iter().any(|p| p == &gl) {
+            parts.push(gl);
+        }
+    }
+    let apprun = dir.join("AppRun");
+    if !apprun.exists() {
+        return;
+    }
+    let preload = parts.join(" ");
+    log::warn!(
+        "[startup] AppImage bundle is missing libEGL.so.1 (SIGSEGV at load on hosts without a system libEGL) — self-healing via re-exec of {} with LD_PRELOAD={}",
+        apprun.display(),
+        preload
+    );
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let mut cmd = std::process::Command::new(&apprun);
+    cmd.args(args)
+        .env("LD_PRELOAD", &preload)
+        .env("LIBGL_ALWAYS_SOFTWARE", "1")
+        .env("__GLX_VENDOR_LIBRARY_NAME", "mesa")
+        .env("GDK_BACKEND", "x11")
+        .env("WEBKIT_DISABLE_COMPOSITING_MODE", "1")
+        .env("WEBKIT_DISABLE_DMABUF_RENDERER", "1")
+        .env(MESA_RELAUNCH_SENTINEL, "1")
+        .env(MISSING_EGL_SENTINEL, "1");
+    if let Some(json) = vendor_json {
+        cmd.env("__EGL_VENDOR_LIBRARY_FILENAMES", json);
+    }
+    match cmd.status() {
+        Ok(s) => std::process::exit(s.code().unwrap_or(0)),
+        Err(_) => {} // best-effort; continue normally
     }
 }
 

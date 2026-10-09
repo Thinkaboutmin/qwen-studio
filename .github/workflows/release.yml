@@ -152,12 +152,18 @@ jobs:
           find "$ROOT/usr/share/icons" -name 'qwen-studio.png' | grep -q . \
             || { echo "ERROR: icon qwen-studio.png not installed in bundle"; exit 1; }
           BIN=$(find "$ROOT/usr/bin" -type f | head -1)
+          # v2.2.14: HARD check — an AppImage whose binary has an unresolved
+          # libEGL DT_NEEDED SIGSEGVs at load on hosts without a system
+          # libEGL (openSUSE Tumbleweed, v2.2.9..v2.2.13 regressions). The
+          # stage-mesa-libs.sh beforeBundleCommand must guarantee the lib is
+          # in the bundle; if it isn't, fail the release instead of shipping.
           if ldd "$BIN" 2>/dev/null | grep 'not found'; then
-            echo "NOTE: unresolved libEGL/libGL handled at runtime by src/lib.rs (stages host Mesa copies + relaunch)."
+            echo "ERROR: binary has unresolved libs even after staging:"
+            ldd "$BIN" 2>/dev/null | grep 'not found' || true
+            exit 1
           fi
-          if ! find "$ROOT/usr/lib" -name 'libEGL.so.1' | grep -q .; then
-            echo "NOTE: libEGL.so.1 not staged at build time — runtime fallback in src/lib.rs will cover it."
-          fi
+          find "$ROOT/usr/lib" -name 'libEGL.so.1' | grep -q . \
+            || { echo "ERROR: libEGL.so.1 not staged into usr/lib — refusing to ship a SIGSEGV-ing AppImage"; exit 1; }
           echo "AppImage verification passed."
 
       - name: Upload build log on failure
@@ -297,7 +303,9 @@ jobs:
             "depend = webkit2gtk-4.1" \
             "depend = gtk3" \
             "depend = libayatana-appindicator" \
-            "depend = nss" > pkgroot/.PKGINFO
+            "depend = nss" \
+            "depend = mesa" \
+            "depend = libglvnd" > pkgroot/.PKGINFO
           # .MTREE: libarchive mtree manifest, gzip -9 -n (identical to makepkg).
           ( cd pkgroot && LC_ALL=C LANG=C mtree -cf . -p type,uid,gid,mode,size,time,sha256digest,flags 2>/dev/null | gzip -9 -n ) > pkgroot/.MTREE
           test -s pkgroot/.MTREE || { echo "ERROR: empty .MTREE"; exit 1; }

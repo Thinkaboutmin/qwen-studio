@@ -1,6 +1,6 @@
 {
   "name": "qwen-studio",
-  "version": "2.2.13",
+  "version": "2.2.14",
   "description": "Open-source Qwen AI desktop client with MCP support. Cross-platform (Linux, Windows, macOS).",
   "author": "youssefvdel <youssefvdel@gmail.com>",
   "homepage": "https://chat.qwen.ai/",
