@@ -93,6 +93,166 @@ fn appdir_root() -> Option<std::path::PathBuf> {
 #[cfg(target_os = "linux")]
 const MESA_RELAUNCH_SENTINEL: &str = "QWEN_STUDIO_MESA_RELAUNCHED";
 
+/// v2.2.15 SIGSEGV root cause: EVERY prior release (v2.2.3..v2.2.14) died at
+/// load time on openSUSE Tumbleweed because we shipped an AppImage whose
+/// binary had an UNRESOLVED DT_NEEDED on libEGL.so.1 (linuxdeploy's gtk
+/// plugin never copies it; CI staging silently no-op'd). The dynamic loader
+/// aborts with SIGSEGV *before main()* — so NO in-process Rust code (the old
+/// re-exec / self-heal logic) could ever run, which is why all those fixes
+/// were structurally incapable of working.
+///
+/// This function runs before any GL/EGL symbol is touched and guarantees a
+/// valid provider exists:
+///  1. If the bundle already ships libEGL.so.1 (v2.2.15+ staged Mesa), or
+///     the HOST resolves libEGL.so.1 via the normal loader search paths, do
+///     nothing — zero overhead, deb/rpm untouched.
+///  2. Otherwise (bundle missing it AND host missing it): locate any concrete
+///     ELF libEGL.so.1* anywhere on the system, stage it into $APPDIR/usr/lib
+///     (writable FUSE view -> lands in the extracted runtime dir the loader
+///     searches via LD_LIBRARY_PATH), then re-exec $APPDIR/AppRun exactly once
+///     (sentinel-guarded, never current_exe()/FUSE mount path).
+///  3. If even that finds no provider anywhere, exec the real binary directly
+///     from the extracted $APPDIR/usr/bin (bypassing the FUSE mount entirely)
+///     so the failure mode is a clean, debuggable loader message instead of a
+///     silent SIGSEGV.
+#[cfg(target_os = "linux")]
+fn ensure_libegl_available() {
+    const STAGE_SENTINEL: &str = "QWEN_STUDIO_LIBEGL_STAGED";
+    // Only inside a mounted AppImage; deb/rpm install libEGL system-wide.
+    let dir = match appdir_root() {
+        Some(d) => d,
+        None => return,
+    };
+    // 1) Bundle already provides a provider? Nothing to do.
+    for sub in ["usr/lib", "usr/lib/x86_64-linux-gnu"] {
+        if dir.join(sub).join("libEGL.so.1").exists() {
+            return;
+        }
+    }
+    // 2) Host loader resolves libEGL.so.1 normally? Also fine. Use the same
+    //    search order glibc would: LD_LIBRARY_PATH, ld.so cache, default dirs.
+    if host_resolves_libegl() {
+        return;
+    }
+    log::warn!("[startup] neither the AppImage bundle nor the host provides libEGL.so.1 — attempting emergency staging (unresolved DT_NEEDED = SIGSEGV at load)");
+
+    // Already tried staging once? Skip straight to the direct-exec fallback.
+    let staged_already = std::env::var(STAGE_SENTINEL).is_ok();
+    if !staged_already {
+        // Find ANY concrete ELF object named libEGL.so.1* on the whole system
+        // (host Mesa dirs first via find_system_mesa_lib, then a bounded
+        // filesystem scan as last resort — e.g. Fedora's /usr/lib64, Gentoo's
+        // split locations, or a stray copy under ~/.local).
+        let mut candidates: Vec<String> = Vec::new();
+        if let Some(p) = find_system_mesa_lib("libEGL.so.1") {
+            candidates.push(p);
+        }
+        // Bounded scan: skip virtual fs, cap depth/entries/time.
+        let finder_out = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(
+                "timeout 10 find /usr /opt /lib -maxdepth 6 \\( -name 'libEGL.so.1*' -o -name 'libEGL.so' \\) -type f 2>/dev/null | head -20",
+            )
+            .output();
+        if let Ok(o) = finder_out {
+            for line in String::from_utf8_lossy(&o.stdout).lines() {
+                let l = line.trim().to_string();
+                if !l.is_empty() && !candidates.contains(&l) {
+                    candidates.push(l);
+                }
+            }
+        }
+        let usrlib = dir.join("usr/lib");
+        std::fs::create_dir_all(&usrlib).ok();
+        for cand in candidates {
+            let path = std::path::Path::new(&cand);
+            if !path.exists() {
+                continue;
+            }
+            // Must be a real ELF shared object (not a text wrapper script).
+            if let Ok(mut f) = std::fs::File::open(path) {
+                use std::io::Read;
+                let mut magic = [0u8; 4];
+                if f.read_exact(&mut magic).is_err() || magic != [0x7f, b'E', b'L', b'F'] {
+                    continue;
+                }
+            } else {
+                continue;
+            }
+            let dest = usrlib.join("libEGL.so.1");
+            if std::fs::copy(path, &dest).is_ok() {
+                log::warn!(
+                    "[startup] staged {} -> {} ; re-exec AppRun once",
+                    cand,
+                    dest.display()
+                );
+                // Re-exec $APPDIR/AppRun (never current_exe/FUSE path) so the
+                // loader picks up the newly staged provider through
+                // LD_LIBRARY_PATH=$APPDIR/usr/lib.
+                let apprun = dir.join("AppRun");
+                if apprun.exists() {
+                    let args: Vec<String> = std::env::args().skip(1).collect();
+                    let status = std::process::Command::new(&apprun)
+                        .args(args)
+                        .env(STAGE_SENTINEL, "1")
+                        .status();
+                    match status {
+                        Ok(s) => std::process::exit(s.code().unwrap_or(0)),
+                        Err(_) => {} // fall through to direct exec below
+                    }
+                }
+                break; // staged; sentinel prevents looping on next pass
+            }
+        }
+    }
+
+    // 3) Last resort: exec the real binary from the EXTRACTED AppDir (plain
+    //    filesystem, not the FUSE mount). If libEGL is still unresolvable the
+    //    loader prints its own clear error instead of a bare SIGSEGV, and
+    //    users can see exactly what is missing.
+    let real_bin = dir.join("usr/bin/qwen-studio");
+    if real_bin.exists() {
+        log::warn!("[startup] falling back to direct exec of {} (no libEGL provider found)", real_bin.display());
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            let args: Vec<String> = std::env::args().skip(1).collect();
+            let mut cmd = std::process::Command::new(&real_bin);
+            cmd.args(args).env(STAGE_SENTINEL, "1");
+            let _ = cmd.exec();
+        }
+    }
+}
+
+/// Mirror the dynamic loader's own resolution order for libEGL.so.1 without
+/// spawning anything: LD_LIBRARY_PATH entries, then the ld.so cache (via
+/// `ldconfig -p` when available), then the usual library directories.
+#[cfg(target_os = "linux")]
+fn host_resolves_libegl() -> bool {
+    if let Ok(ldlp) = std::env::var("LD_LIBRARY_PATH") {
+        for p in ldlp.split(':') {
+            if !p.is_empty() && std::path::Path::new(p).join("libEGL.so.1").exists() {
+                return true;
+            }
+        }
+    }
+    // ld.so.cache query — authoritative when present.
+    if let Ok(o) = std::process::Command::new("ldconfig").arg("-p").output() {
+        if o.status.success() {
+            let text = String::from_utf8_lossy(&o.stdout);
+            if text.lines().any(|l| l.contains("libEGL.so.1")) {
+                return true;
+            }
+        }
+    }
+    for d in ["/usr/lib", "/usr/lib64", "/lib", "/lib64", "/usr/lib/x86_64-linux-gnu", "/usr/lib32"] {
+        if std::path::Path::new(d).join("libEGL.so.1").exists() {
+            return true;
+        }
+    }
+    false
+}
+
 #[cfg(target_os = "linux")]
 fn relaunch_for_gl_fix() {
     if std::env::var(MESA_RELAUNCH_SENTINEL).is_ok() {
@@ -316,7 +476,12 @@ fn maybe_reexec_missing_libegl(preload_parts: &[String], vendor_json: Option<&st
 pub fn run() {
     #[cfg(target_os = "linux")]
     {
-        // NOTE: relaunch_for_gl_fix() MUST stay the very first thing on Linux —
+        // v2.2.15: guarantee a loadable libEGL provider BEFORE anything else.
+        // If the bundle has an unresolved DT_NEEDED on libEGL.so.1 the loader
+        // SIGSEGVs before main() ever runs, so this must be the first action
+        // in run(): stage + re-exec when needed, otherwise no-op.
+        ensure_libegl_available();
+        // NOTE: relaunch_for_gl_fix() MUST stay immediately after it —
         // it re-execs the process before any GTK/GL context is created (see
         // doc comment; replaces the old AppImage-only relaunch_for_mesa_egl
         // gate that left deb/rpm users with the grey-screen EGL crash).

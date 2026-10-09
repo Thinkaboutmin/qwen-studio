@@ -116,9 +116,71 @@ jobs:
           # previous step. Re-running a full bundle would repackage everything
           # unnecessarily.
           args: --bundles appimage
-        # NOTE: Mesa libEGL/libGL are staged into the AppDir by the
-        # beforeBundleCommand hook (stage-mesa-libs.sh), which the bundler runs
-        # from inside the AppDir right before invoking linuxdeploy.
+
+      - name: Post-process AppImage (guarantee libEGL.so.1 + libGL.so.1)
+        # v2.2.3..v2.2.14 shipped AppImages whose binary had an UNRESOLVED
+        # DT_NEEDED on libEGL.so.1 -> SIGSEGV at load time on hosts without a
+        # system libEGL in the loader path (openSUSE Tumbleweed). The
+        # beforeBundleCommand staging hook cannot fix this reliably because
+        # tauri-action may rebuild/repackage the AppDir after it runs. This
+        # step operates DIRECTLY on the final .AppImage, so nothing can undo
+        # it afterwards: extract, inject the full working Mesa/libglvnd
+        # closure into usr/lib, re-pack with appimagetool.
+        env:
+          APPIMAGE_EXTRACT_AND_RUN: "1"
+        run: |
+          set -euo pipefail
+          APPIMAGE=$(find target/release/bundle/appimage -maxdepth 1 -name '*.AppImage' | head -1)
+          test -n "$APPIMAGE" || { echo "No AppImage produced"; exit 1; }
+          rm -rf /tmp/post-appdir squashfs-root
+          "$APPIMAGE" --appimage-extract >/dev/null
+          mv squashfs-root /tmp/post-appdir
+          ROOT=/tmp/post-appdir
+          mkdir -p "$ROOT/usr/lib"
+
+          stage() { # $1 = glob base name e.g. libEGL.so.1
+            find "$ROOT/usr" -name "$1" 2>/dev/null | grep -q . && return 0
+            for d in /usr/lib/mesa /usr/lib/x86_64-linux-gnu /usr/lib; do
+              if [ -e "$d/$1" ]; then cp -L "$d/$1" "$ROOT/usr/lib/"; echo "[post-stage] $d/$1"; return 0; fi
+            done
+            return 1
+          }
+
+          NEED_APT=0
+          stage libEGL.so.1 || NEED_APT=1
+          stage libGL.so.1  || NEED_APT=1
+
+          if [ "$NEED_APT" = "1" ] || ! ls "$ROOT"/usr/lib/libEGL_mesa.so.0* >/dev/null 2>&1; then
+            echo "[post-stage] falling back to apt download of full Mesa/libglvnd closure"
+            TMP=$(mktemp -d); trap 'rm -rf "$TMP"' EXIT
+            ( cd "$TMP" && apt-get download -y \
+                libegl1 libgl1 libglvnd0 \
+                libegl-mesa0 libgbm1 libglapi-mesa \
+                libdrm2 libexpat1 libxshmfence1 \
+                libx11-xcb1 libxcb-dri2-0 libxcb-dri3-0 libxcb-present0 \
+                libxcb-randr0 libxcb-sync1 libxcb-xfixes0 )
+            mkdir -p "$TMP/root"
+            for debfile in "$TMP"/*.deb; do dpkg-deb -x "$debfile" "$TMP/root" || true; done
+            find "$TMP/root" \( -name 'libEGL.so.1*' -o -name 'libGL.so.1*' -o -name 'libGLdispatch.so.0*' -o -name 'libGLX.so.0*' -o -name 'libGLESv*.so.2*' -o -name 'libEGL_mesa.so.0*' -o -name 'libgbm.so.1*' -o -name 'libglapi.so.0*' -o -name 'libdrm.so.2*' -o -name 'libexpat.so.1*' -o -name 'libxshmfence.so.1*' -o -name 'libX11-xcb.so.1*' -o -name 'libxcb-dri2.so.0*' -o -name 'libxcb-dri3.so.0*' -o -name 'libxcb-present.so.0*' -o -name 'libxcb-randr.so.0*' -o -name 'libxcb-sync.so.1*' -o -name 'libxcb-xfixes.so.0*' \) -type f 2>/dev/null | while read -r f; do
+              b=$(basename "$f")
+              [ ! -e "$ROOT/usr/lib/$b" ] && cp -L "$f" "$ROOT/usr/lib/$b" && echo "[post-stage] (apt) $b"
+            done
+          fi
+
+          # HARD GUARD: refuse to continue if the provider is still missing.
+          find "$ROOT/usr/lib" -name 'libEGL.so.1' | grep -q . || { echo "ERROR: could not stage libEGL.so.1"; exit 1; }
+          find "$ROOT/usr/lib" -name 'libGL.so.1'  | grep -q . || { echo "ERROR: could not stage libGL.so.1"; exit 1; }
+
+          # Re-pack. appimagetool needs to be available; tauri bundles it under
+          # ~/.cache but that is not guaranteed — download the release binary.
+          if ! command -v appimagetool >/dev/null 2>&1; then
+            curl -sL -o /usr/local/bin/appimagetool https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage
+            chmod +x /usr/local/bin/appimagetool
+          fi
+          VERSION="${GITHUB_REF_NAME#v}" ARCH=x86_64 appimagetool --appimage-extract-and-run /tmp/post-appdir "$(basename "$APPIMAGE")" >/dev/null 2>&1 || \
+            VERSION="${GITHUB_REF_NAME#v}" ARCH=x86_64 appimagetool /tmp/post-appdir "$(basename "$APPIMAGE")"
+          mv -f "$(basename "$APPIMAGE")" "$APPIMAGE"
+          echo "[post-stage] repacked $APPIMAGE with staged Mesa libs"
 
       - name: Verify AppImage bundle integrity
         # Guards against shipping broken AppImages again. Checks:
